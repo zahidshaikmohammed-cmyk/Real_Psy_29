@@ -93,10 +93,11 @@ class FreshnessRecoveryEngine:
         self.reconnect_attempt = 0
 
     def on_tick(self, symbol: str, now: float | None = None) -> None:
-        if symbol not in self._last_seen:  # type: ignore[operator]
+        if symbol not in self.symbols:
             raise KeyError(f"unknown symbol: {symbol}")
         t = monotonic() if now is None else now
-        self._last_seen[symbol] = t  # type: ignore[index]
+        assert self._last_seen is not None
+        self._last_seen[symbol] = t
         self._last_market_tick_monotonic = t
 
     def on_disconnect(self, reason_code: int | None = None) -> RecoveryDecision:
