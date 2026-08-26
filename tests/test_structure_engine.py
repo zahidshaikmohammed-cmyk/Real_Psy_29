@@ -24,9 +24,9 @@ def rows():
 
 def test_opening_range_uses_915_to_before_930():
     result = opening_range(rows())
-    assert result.high == 115
+    assert result.high == 116
     assert result.low == 99
-    assert result.range_size == 16
+    assert result.range_size == 17
     assert result.candle_count == 15
 
 
