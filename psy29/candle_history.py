@@ -105,6 +105,9 @@ def _parse_columnar(payload: object, trading_date: date, *, filter_date: bool = 
 def _previous_daily_candles(payload: object, trading_date: date) -> tuple[Candle, ...]:
     candles = _parse_columnar(payload, trading_date, filter_date=False)
     candles = tuple(c for c in candles if c.timestamp.date() < trading_date)
+    dates = [c.timestamp.date() for c in candles]
+    if len(set(dates)) != len(dates):
+        raise CandleHistoryError("Dhan returned duplicate daily candle dates")
     if len(candles) < PREVIOUS_DAILY_CANDLE_COUNT:
         raise CandleHistoryError(
             f"Dhan returned only {len(candles)} previous daily candles; "
