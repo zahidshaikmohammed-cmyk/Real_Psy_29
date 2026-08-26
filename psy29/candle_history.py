@@ -12,6 +12,7 @@ IST = ZoneInfo("Asia/Kolkata")
 MARKET_OPEN = time(9, 15)
 MARKET_CLOSE = time(15, 30)
 SUPPORTED_INTERVALS = (1, 5, 15, 60)
+PREVIOUS_DAILY_CANDLE_COUNT = 30
 
 
 class CandleHistoryError(RuntimeError):
@@ -39,6 +40,7 @@ class StockSessionHistory:
     candles_5m: tuple[Candle, ...]
     candles_15m: tuple[Candle, ...]
     candles_1h: tuple[Candle, ...]
+    previous_daily_candles: tuple[Candle, ...]
 
 
 def _session_date(now: datetime | None = None) -> date:
@@ -53,13 +55,12 @@ def _epoch_to_ist(value: object) -> datetime:
         raise CandleHistoryError("Dhan candle contains an invalid epoch timestamp") from exc
 
 
-def _parse_columnar(payload: object, trading_date: date) -> tuple[Candle, ...]:
+def _parse_columnar(payload: object, trading_date: date, *, filter_date: bool = True) -> tuple[Candle, ...]:
     if not isinstance(payload, dict):
         raise CandleHistoryError("Unexpected Dhan candle response")
     required = ("open", "high", "low", "close", "volume", "timestamp")
     if any(not isinstance(payload.get(key), list) for key in required):
         raise CandleHistoryError("Dhan candle response is missing required arrays")
-
     columns = [payload[key] for key in required]
     if len({len(column) for column in columns}) != 1:
         raise CandleHistoryError("Dhan candle arrays have inconsistent lengths")
@@ -67,7 +68,7 @@ def _parse_columnar(payload: object, trading_date: date) -> tuple[Candle, ...]:
     candles: list[Candle] = []
     for values in zip(*columns):
         timestamp = _epoch_to_ist(values[5])
-        if timestamp.date() != trading_date:
+        if filter_date and timestamp.date() != trading_date:
             continue
         try:
             candle = Candle(
@@ -91,31 +92,20 @@ def _parse_columnar(payload: object, trading_date: date) -> tuple[Candle, ...]:
     return tuple(candles)
 
 
-def _previous_day(payload: object, trading_date: date) -> tuple[float | None, float | None, float | None]:
-    if not isinstance(payload, dict):
-        raise CandleHistoryError("Unexpected Dhan daily response")
-    required = ("open", "high", "low", "close", "volume", "timestamp")
-    if any(not isinstance(payload.get(key), list) for key in required):
-        raise CandleHistoryError("Dhan daily response is missing required arrays")
-    columns = [payload[key] for key in required]
-    if len({len(column) for column in columns}) != 1:
-        raise CandleHistoryError("Dhan daily arrays have inconsistent lengths")
+def _previous_daily_candles(payload: object, trading_date: date) -> tuple[Candle, ...]:
+    candles = _parse_columnar(payload, trading_date, filter_date=False)
+    candles = tuple(c for c in candles if c.timestamp.date() < trading_date)
+    dates = [c.timestamp.date() for c in candles]
+    if len(set(dates)) != len(dates):
+        raise CandleHistoryError("Dhan returned duplicate daily candle dates")
+    return candles[-PREVIOUS_DAILY_CANDLE_COUNT:]
 
-    candidates: list[tuple[datetime, float, float, float]] = []
-    for values in zip(*columns):
-        timestamp = _epoch_to_ist(values[5])
-        if timestamp.date() >= trading_date:
-            continue
-        try:
-            candidates.append((timestamp, float(values[1]), float(values[2]), float(values[3])))
-        except (TypeError, ValueError) as exc:
-            raise CandleHistoryError("Dhan daily response contains invalid OHLC values") from exc
 
-    if not candidates:
+def _previous_day(candles: tuple[Candle, ...]) -> tuple[float | None, float | None, float | None]:
+    if not candles:
         return None, None, None
-    previous_date = max(item[0].date() for item in candidates)
-    day = [item for item in candidates if item[0].date() == previous_date]
-    return max(item[1] for item in day), min(item[2] for item in day), day[-1][3]
+    day = candles[-1]
+    return day.high, day.low, day.close
 
 
 def acquire_stock_session_history(
@@ -145,13 +135,14 @@ def acquire_stock_session_history(
         series[interval] = _parse_columnar(payload, trading_date)
 
     fetch_daily = daily_fetcher or client.historical_daily
-    previous_start = trading_date - timedelta(days=7)
+    previous_start = trading_date - timedelta(days=60)
     daily_payload = fetch_daily(
         instrument.security_id,
         previous_start.isoformat(),
         trading_date.isoformat(),
     )
-    previous_high, previous_low, previous_close = _previous_day(daily_payload, trading_date)
+    previous_daily = _previous_daily_candles(daily_payload, trading_date)
+    previous_high, previous_low, previous_close = _previous_day(previous_daily)
 
     return StockSessionHistory(
         symbol=symbol,
@@ -163,4 +154,5 @@ def acquire_stock_session_history(
         candles_5m=series[5],
         candles_15m=series[15],
         candles_1h=series[60],
+        previous_daily_candles=previous_daily,
     )
