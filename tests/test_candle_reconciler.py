@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -38,3 +38,9 @@ def test_rejects_invalid_ohlc():
     bad = Candle(c(15).timestamp, 100, 99, 98, 100, 100)
     with pytest.raises(CandleIntegrityError):
         reconcile_candles((bad,), (), interval_minutes=1)
+
+
+def test_rejects_conflicting_duplicate_candle():
+    conflicting = Candle(c(15).timestamp, 101, 102, 100, 101, 100)
+    with pytest.raises(CandleIntegrityError, match="Conflicting candle"):
+        reconcile_candles((c(15),), (conflicting,), interval_minutes=1)
