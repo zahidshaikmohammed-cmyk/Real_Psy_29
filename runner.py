@@ -2,12 +2,49 @@ import threading
 import time
 
 import main
+from psy29.intraday_store import IntradayStore
 
 
 # Replace the legacy startup hook with a supervisor that brings the live feed up
 # before the slower historical backfill. This keeps /data live immediately at
 # session open instead of blocking on 29 sequential REST history requests.
 main.app.router.on_startup.clear()
+
+store = IntradayStore()
+CHECKPOINT_SECONDS = 60.0
+
+
+def _snapshot() -> tuple[str | None, dict]:
+    with main.lock:
+        trading_date = main.state.get("trading_date")
+        stocks = {
+            symbol: main.clean_stock(payload)
+            for symbol, payload in main.state.get("stocks", {}).items()
+        }
+    return trading_date, stocks
+
+
+def _checkpoint(force: bool = False) -> int:
+    trading_date, stocks = _snapshot()
+    if not trading_date or not stocks:
+        return 0
+    saved = store.save_market(trading_date, stocks)
+    if saved:
+        main.log.info("Intraday Postgres checkpoint: %s/%s stocks", saved, len(stocks))
+    return saved
+
+
+def _checkpoint_worker() -> None:
+    while True:
+        try:
+            if main.in_session(main.now_ist()):
+                _checkpoint()
+                time.sleep(CHECKPOINT_SECONDS)
+            else:
+                time.sleep(10)
+        except Exception as exc:
+            main.log.warning("Intraday checkpoint worker error: %s", exc)
+            time.sleep(CHECKPOINT_SECONDS)
 
 
 def _seed_live_state(token: str, security_map: dict[str, str]) -> None:
@@ -49,8 +86,21 @@ def _seed_live_state(token: str, security_map: dict[str, str]) -> None:
                 "_one_min": [],
                 "_volume_anchor": None,
             }
-        main.state["source_status"] = "LIVE"
-        main.state["last_update"] = now.isoformat()
+
+
+def _restore_checkpoint_if_needed(trading_date: str) -> None:
+    saved = store.load_session(trading_date)
+    if not saved:
+        return
+    with main.lock:
+        for symbol, payload in saved.items():
+            if symbol not in main.STOCKS:
+                continue
+            current = main.state["stocks"].get(symbol)
+            # Only use durable data as a fallback. Fresh live state remains authoritative.
+            if not current or current.get("current_price") is None:
+                main.state["stocks"][symbol] = payload
+    main.log.info("Intraday Postgres recovery loaded %s/%s saved stocks", len(saved), len(main.STOCKS))
 
 
 def _backfill_worker(token: str, security_map: dict[str, str]) -> None:
@@ -88,6 +138,8 @@ def _backfill_worker(token: str, security_map: dict[str, str]) -> None:
         except Exception as exc:
             main.log.exception("Background backfill failed for %s: %s", symbol, exc)
 
+    _checkpoint(force=True)
+
 
 def _supervisor() -> None:
     while True:
@@ -107,6 +159,7 @@ def _supervisor() -> None:
 
             security_map = main.load_security_map()
             _seed_live_state(token, security_map)
+            _restore_checkpoint_if_needed(now.date().isoformat())
             threading.Thread(
                 target=_backfill_worker,
                 args=(token, security_map),
@@ -117,6 +170,7 @@ def _supervisor() -> None:
             asyncio_runner = lambda: main.asyncio.run(main.websocket_loop(token))
             asyncio_runner()
 
+            _checkpoint(force=True)
             with main.lock:
                 main.state["source_status"] = "POST_CLOSE" if not main.in_session(main.now_ist()) else "RECONNECTING"
             if not main.in_session(main.now_ist()):
@@ -132,6 +186,7 @@ def _supervisor() -> None:
 def startup() -> None:
     with main.lock:
         main.state["collector_started"] = True
+    threading.Thread(target=_checkpoint_worker, daemon=True, name="psy29-db-checkpoint").start()
     threading.Thread(target=_supervisor, daemon=True, name="psy29-supervisor").start()
 
 
