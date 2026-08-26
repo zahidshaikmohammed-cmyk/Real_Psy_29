@@ -1,0 +1,1 @@
+The collector supervisor module is intentionally additive; main.py wiring must be updated together with the runtime health contract before merge.
