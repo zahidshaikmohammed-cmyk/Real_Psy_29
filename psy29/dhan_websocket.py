@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import struct
 from dataclasses import dataclass
 from typing import Awaitable, Callable
@@ -17,7 +18,7 @@ UNSUBSCRIBE_QUOTE = 18
 DISCONNECT = 12
 
 HEADER_SIZE = 8
-QUOTE_MIN_SIZE = 51
+QUOTE_PACKET_SIZE = 50
 
 
 class DhanWebSocketError(RuntimeError):
@@ -60,23 +61,18 @@ def subscription_messages(registry: InstrumentRegistry) -> list[dict]:
         {"ExchangeSegment": item.exchange_segment, "SecurityId": item.security_id}
         for item in registry.instruments
     ]
-    return [
-        {
-            "RequestCode": SUBSCRIBE_QUOTE,
-            "InstrumentCount": len(instruments),
-            "InstrumentList": instruments,
-        }
-    ]
+    return [{
+        "RequestCode": SUBSCRIBE_QUOTE,
+        "InstrumentCount": len(instruments),
+        "InstrumentList": instruments,
+    }]
 
 
 def parse_quote_packet(payload: bytes, registry: InstrumentRegistry) -> QuoteTick | None:
-    if len(payload) < QUOTE_MIN_SIZE:
-        return None
-    if payload[0] != 4:
+    if len(payload) < QUOTE_PACKET_SIZE or payload[0] != 4:
         return None
 
-    security_id_int = struct.unpack_from("<i", payload, 4)[0]
-    security_id = str(security_id_int)
+    security_id = str(struct.unpack_from("<i", payload, 4)[0])
     instrument = registry.by_security_id.get(security_id)
     if instrument is None:
         return None
@@ -132,10 +128,9 @@ async def run_once(
     *,
     open_timeout: float = 15.0,
 ) -> None:
-    url = websocket_url(token, client_id)
     try:
         async with websockets.connect(
-            url,
+            websocket_url(token, client_id),
             open_timeout=open_timeout,
             ping_interval=20,
             ping_timeout=40,
@@ -143,7 +138,7 @@ async def run_once(
             max_size=2**20,
         ) as websocket:
             for message in subscription_messages(registry):
-                await websocket.send(__import__("json").dumps(message, separators=(",", ":")))
+                await websocket.send(json.dumps(message, separators=(",", ":")))
             await receive_quotes(websocket, registry, on_quote, on_disconnect)
     except (OSError, asyncio.TimeoutError, websockets.WebSocketException) as exc:
         raise DhanWebSocketError("Dhan live market feed connection failed") from exc
