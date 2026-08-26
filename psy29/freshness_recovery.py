@@ -27,8 +27,8 @@ class RecoveryAction(str, Enum):
 class FreshnessPolicy:
     live_after_seconds: float = 5.0
     degraded_after_seconds: float = 15.0
-    stale_after_seconds: float = 30.0
-    reconnect_after_seconds: float = 35.0
+    stale_after_seconds: float = 129.0
+    reconnect_after_seconds: float = 130.0
     max_reconnect_attempts: int = 8
     initial_backoff_seconds: float = 1.0
     max_backoff_seconds: float = 30.0
@@ -142,7 +142,7 @@ class FreshnessRecoveryEngine:
             return self._decision(FeedHealth.LIVE, RecoveryAction.NONE, (), (), "all instruments have fresh ticks")
         if age <= self.policy.degraded_after_seconds:
             return self._decision(FeedHealth.DEGRADED, RecoveryAction.REST_RECONCILE, (), (), "latest feed activity is slowing")
-        if age < self.policy.reconnect_after_seconds:
+        if age < self.policy.stale_after_seconds:
             return self._decision(FeedHealth.STALE, RecoveryAction.REST_RECONCILE, (), (), "feed activity is stale")
         return self._decision(FeedHealth.STALE, RecoveryAction.RECONNECT, (), (), "feed has exceeded reconnect threshold")
 
