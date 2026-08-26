@@ -14,9 +14,9 @@ def registry():
 
 
 def quote_packet():
-    header = struct.pack("<BhBi", 4, 50, 0, 123)
+    header = struct.pack("<BhBi", 4, 52, 0, 123)
     body = struct.pack(
-        "<fhifiii ffff".replace(" ", ""),
+        "<fiifiii ffff".replace(" ", ""),
         2500.5, 10, 1720000000, 2501.0, 100000, 2000, 3000,
         2490.0, 2505.0, 2510.0, 2480.0,
     )
@@ -42,8 +42,10 @@ def test_quote_packet_decodes_documented_fields():
     assert tick.ltp == 2500.5
     assert tick.last_trade_quantity == 10
     assert tick.last_trade_epoch == 1720000000
+    assert tick.average_trade_price == 2501.0
     assert tick.volume == 100000
     assert tick.day_open == 2490.0
+    assert tick.day_close == 2505.0
     assert tick.day_high == 2510.0
     assert tick.day_low == 2480.0
 
