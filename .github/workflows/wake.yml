@@ -1,0 +1,16 @@
+name: PSY29 Render Wake
+
+on:
+  schedule:
+    # 09:15-15:15 IST = 03:45-09:45 UTC, weekdays.
+    - cron: "*/10 3-8 * * 1-5"
+    - cron: "0,10,20,30,40 9 * * 1-5"
+  workflow_dispatch:
+
+jobs:
+  wake:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wake PSY29 live collector
+        run: |
+          curl --fail --silent --show-error --max-time 30 https://psy29-live-data.onrender.com/health
