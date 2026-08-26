@@ -15,10 +15,10 @@ FEED_VERSION = "2"
 AUTH_TYPE = "2"
 SUBSCRIBE_QUOTE = 17
 UNSUBSCRIBE_QUOTE = 18
-DISCONNECT = 12
+DISCONNECT = 50
 
 HEADER_SIZE = 8
-QUOTE_PACKET_SIZE = 50
+QUOTE_PACKET_SIZE = 52
 
 
 class DhanWebSocketError(RuntimeError):
@@ -81,21 +81,21 @@ def parse_quote_packet(payload: bytes, registry: InstrumentRegistry) -> QuoteTic
         symbol=instrument.symbol,
         security_id=security_id,
         ltp=struct.unpack_from("<f", payload, 8)[0],
-        last_trade_quantity=struct.unpack_from("<h", payload, 12)[0],
-        last_trade_epoch=struct.unpack_from("<i", payload, 14)[0],
-        average_trade_price=struct.unpack_from("<f", payload, 18)[0],
-        volume=struct.unpack_from("<i", payload, 22)[0],
-        total_sell_quantity=struct.unpack_from("<i", payload, 26)[0],
-        total_buy_quantity=struct.unpack_from("<i", payload, 30)[0],
-        day_open=struct.unpack_from("<f", payload, 34)[0],
-        day_close=struct.unpack_from("<f", payload, 38)[0],
-        day_high=struct.unpack_from("<f", payload, 42)[0],
-        day_low=struct.unpack_from("<f", payload, 46)[0],
+        last_trade_quantity=struct.unpack_from("<i", payload, 12)[0],
+        last_trade_epoch=struct.unpack_from("<i", payload, 16)[0],
+        average_trade_price=struct.unpack_from("<f", payload, 20)[0],
+        volume=struct.unpack_from("<i", payload, 24)[0],
+        total_sell_quantity=struct.unpack_from("<i", payload, 28)[0],
+        total_buy_quantity=struct.unpack_from("<i", payload, 32)[0],
+        day_open=struct.unpack_from("<f", payload, 36)[0],
+        day_close=struct.unpack_from("<f", payload, 40)[0],
+        day_high=struct.unpack_from("<f", payload, 44)[0],
+        day_low=struct.unpack_from("<f", payload, 48)[0],
     )
 
 
 def parse_disconnect_packet(payload: bytes) -> FeedDisconnect | None:
-    if len(payload) < 10 or payload[0] != 50:
+    if len(payload) < HEADER_SIZE + 2 or payload[0] != 50:
         return None
     return FeedDisconnect(reason_code=struct.unpack_from("<h", payload, 8)[0])
 
