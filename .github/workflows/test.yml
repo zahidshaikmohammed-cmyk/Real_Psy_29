@@ -22,5 +22,9 @@ jobs:
           cache: pip
       - name: Install dependencies
         run: python -m pip install -r requirements.txt
+      - name: Verify dependency consistency
+        run: python -m pip check
+      - name: Compile source and tests
+        run: python -m compileall -q psy29 tests
       - name: Run complete pytest suite
         run: python -m pytest -q -rA
