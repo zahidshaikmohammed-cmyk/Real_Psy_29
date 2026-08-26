@@ -1,6 +1,11 @@
 import struct
 
-from psy29.dhan_websocket import parse_disconnect_packet, parse_quote_packet, subscription_messages, websocket_url
+from psy29.dhan_websocket import (
+    parse_disconnect_packet,
+    parse_quote_packet,
+    subscription_messages,
+    websocket_url,
+)
 from psy29.instrument_registry import Instrument, InstrumentRegistry
 
 
@@ -9,9 +14,9 @@ def registry():
 
 
 def quote_packet():
-    header = struct.pack("<Bhi", 4, 51, 123)
+    header = struct.pack("<BhBi", 4, 50, 0, 123)
     body = struct.pack(
-        "<fhiffiiiff f".replace(" ", ""),
+        "<fhifiii ffff".replace(" ", ""),
         2500.5, 10, 1720000000, 2501.0, 100000, 2000, 3000,
         2490.0, 2505.0, 2510.0, 2480.0,
     )
@@ -50,7 +55,7 @@ def test_unknown_security_is_ignored():
 
 
 def test_disconnect_packet_decodes_reason():
-    payload = struct.pack("<Bhi h", 50, 10, 123, 807)
+    payload = struct.pack("<BhBi h", 50, 10, 0, 123, 807)
     event = parse_disconnect_packet(payload)
     assert event is not None
     assert event.reason_code == 807
