@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from datetime import date, datetime
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -42,6 +41,22 @@ class NormalizedStock(BaseModel):
     last_tick: str | None
 
 
+class DiagnosticModel(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    status: str
+    error_code: str | None = None
+    error_message: str | None = None
+    error_time: str | None = None
+    stage: str | None = None
+    affected_stocks: list[str] = Field(default_factory=list)
+    last_good_tick: str | None = None
+    recovery_action: str | None = None
+    recovery_attempts: int = 0
+    recovery_limit: int | None = None
+    data_safe: bool = True
+
+
 class NormalizedMarketResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -54,6 +69,7 @@ class NormalizedMarketResponse(BaseModel):
     stocks_expected: int = Field(default=29, ge=0)
     stocks_loaded: int = Field(ge=0)
     stocks: dict[str, NormalizedStock]
+    diagnostic: DiagnosticModel = Field(default_factory=lambda: DiagnosticModel(status="OK"))
 
 
 def _clean(value: Any) -> Any:
@@ -75,7 +91,7 @@ def normalize_market(raw: dict[str, Any]) -> dict[str, Any]:
     stocks = cleaned.get("stocks", {})
     normalized = NormalizedMarketResponse.model_validate(
         {**cleaned, "stocks": {symbol: normalize_stock(stock) for symbol, stock in stocks.items()},
-               "stocks_loaded": len(stocks)}
+         "stocks_loaded": len(stocks)}
     )
     if normalized.stocks_expected != 29:
         raise ValueError("stocks_expected must remain 29")
