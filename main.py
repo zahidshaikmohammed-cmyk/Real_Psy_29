@@ -1,1 +1,1 @@
-__PLACEHOLDER__
+# RESTORE REQUIRED FROM production-hardening
