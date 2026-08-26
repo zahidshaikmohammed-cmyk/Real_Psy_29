@@ -125,7 +125,7 @@ class FreshnessRecoveryEngine:
     def observe(self, now: float | None = None) -> RecoveryDecision:
         t = monotonic() if now is None else now
         last_seen = self._last_seen or {}
-        stale = tuple(sorted(s for s in self.symbols if s not in last_seen or t - last_seen[s] >= self.policy.stale_after_seconds))
+        stale = tuple(sorted(s for s in self.symbols if s not in last_seen or t - last_seen[s] > self.policy.stale_after_seconds))
         missing = tuple(sorted(s for s in self.symbols if s not in last_seen))
 
         if not self._connected:
@@ -142,9 +142,9 @@ class FreshnessRecoveryEngine:
             return self._decision(FeedHealth.LIVE, RecoveryAction.NONE, (), (), "all instruments have fresh ticks")
         if age <= self.policy.degraded_after_seconds:
             return self._decision(FeedHealth.DEGRADED, RecoveryAction.REST_RECONCILE, (), (), "latest feed activity is slowing")
-        if age < self.policy.stale_after_seconds:
-            return self._decision(FeedHealth.STALE, RecoveryAction.REST_RECONCILE, (), (), "feed activity is stale")
-        return self._decision(FeedHealth.STALE, RecoveryAction.RECONNECT, (), (), "feed has exceeded reconnect threshold")
+        if age <= self.policy.stale_after_seconds:
+            return self._decision(FeedHealth.DEGRADED, RecoveryAction.REST_RECONCILE, (), (), "feed activity is slowing but is not stale")
+        return self._decision(FeedHealth.STALE, RecoveryAction.RECONNECT, (), (), "feed has exceeded stale threshold")
 
     def next_backoff(self) -> float:
         exponent = max(0, self.reconnect_attempt)
