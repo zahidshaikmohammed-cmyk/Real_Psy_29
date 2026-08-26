@@ -22,6 +22,25 @@ def test_all_instruments_fresh_is_live():
     assert result.action is RecoveryAction.NONE
 
 
+def test_129_seconds_is_not_stale():
+    e = engine()
+    e.on_tick("NESTLEIND", 0.0)
+    e.on_tick("VEDL", 0.0)
+    e.on_tick("AMBUJACEM", 0.0)
+    result = e.observe(129.0)
+    assert result.health is not FeedHealth.STALE
+    assert result.stale_symbols == ()
+
+
+def test_greater_than_129_seconds_is_stale():
+    e = engine()
+    e.on_tick("NESTLEIND", 0.0)
+    e.on_tick("VEDL", 0.0)
+    e.on_tick("AMBUJACEM", 0.0)
+    result = e.observe(129.001)
+    assert result.health is FeedHealth.STALE
+
+
 def test_missing_instrument_uses_rest_reconciliation_before_reconnect():
     e = engine()
     e.on_tick("NESTLEIND", 1.0)
