@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: psy29-live-data
+    runtime: python
+    plan: free
+    region: singapore
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    autoDeploy: true
+    healthCheckPath: /health
