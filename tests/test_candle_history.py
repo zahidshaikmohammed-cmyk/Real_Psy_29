@@ -13,26 +13,42 @@ def registry():
     return InstrumentRegistry((Instrument("NESTLEIND", "123"),))
 
 
-def candle_rows():
-    return [
-        {"timestamp": "2026-08-26T09:15:00+05:30", "open": 100, "high": 102, "low": 99, "close": 101, "volume": 1000},
-        {"timestamp": "2026-08-26T09:16:00+05:30", "open": 101, "high": 103, "low": 100, "close": 102, "volume": 1100},
-    ]
+def candle_payload():
+    return {
+        "open": [100, 101],
+        "high": [102, 103],
+        "low": [99, 100],
+        "close": [101, 102],
+        "volume": [1000, 1100],
+        "timestamp": [
+            1787735700,
+            1787735760,
+        ],
+    }
 
 
-def fetcher(_security_id, interval, _start, _end):
-    return candle_rows()
+def daily_payload():
+    return {
+        "open": [90],
+        "high": [110],
+        "low": [88],
+        "close": [105],
+        "volume": [5000],
+        "timestamp": [1787649300],
+    }
 
 
-def test_acquires_genuine_timeframes_and_previous_day(monkeypatch):
+def fetcher(_security_id, _interval, _start, _end):
+    return candle_payload()
+
+
+def test_acquires_genuine_timeframes_and_previous_day():
     class Client:
-        def intraday_candles(self, *args):
+        def intraday(self, *args):
             return fetcher(*args)
 
-        def daily_history(self, *args):
-            return [
-                {"timestamp": "2026-08-25T09:15:00+05:30", "open": 90, "high": 110, "low": 88, "close": 105, "volume": 5000}
-            ]
+        def historical_daily(self, *args):
+            return daily_payload()
 
     history = acquire_stock_session_history(
         Client(), registry(), "NESTLEIND",
@@ -48,14 +64,17 @@ def test_acquires_genuine_timeframes_and_previous_day(monkeypatch):
 
 
 def test_rejects_duplicate_timestamps():
-    rows = candle_rows() + [candle_rows()[0]]
+    rows = candle_payload()
+    rows["timestamp"].append(rows["timestamp"][0])
+    for key in ("open", "high", "low", "close", "volume"):
+        rows[key].append(rows[key][0])
 
     class Client:
-        def intraday_candles(self, *args):
+        def intraday(self, *args):
             return rows
 
-        def daily_history(self, *args):
-            return []
+        def historical_daily(self, *args):
+            return daily_payload()
 
     with pytest.raises(CandleHistoryError):
         acquire_stock_session_history(
