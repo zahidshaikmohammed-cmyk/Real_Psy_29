@@ -55,6 +55,17 @@ def _epoch_to_ist(value: object) -> datetime:
         raise CandleHistoryError("Dhan candle contains an invalid epoch timestamp") from exc
 
 
+def _validate_candle(candle: Candle) -> None:
+    if candle.timestamp.tzinfo is None:
+        raise CandleHistoryError("Dhan candle timestamp must be timezone-aware")
+    if any(price <= 0 for price in (candle.open, candle.high, candle.low, candle.close)):
+        raise CandleHistoryError("Dhan candle contains a non-positive price")
+    if candle.volume < 0:
+        raise CandleHistoryError("Dhan candle contains negative volume")
+    if candle.high < max(candle.open, candle.close) or candle.low > min(candle.open, candle.close):
+        raise CandleHistoryError("Dhan candle violates OHLC price bounds")
+
+
 def _parse_columnar(payload: object, trading_date: date, *, filter_date: bool = True) -> tuple[Candle, ...]:
     if not isinstance(payload, dict):
         raise CandleHistoryError("Unexpected Dhan candle response")
@@ -81,8 +92,7 @@ def _parse_columnar(payload: object, trading_date: date, *, filter_date: bool = 
             )
         except (TypeError, ValueError) as exc:
             raise CandleHistoryError("Dhan candle contains an invalid OHLCV value") from exc
-        if candle.high < max(candle.open, candle.close) or candle.low > min(candle.open, candle.close):
-            raise CandleHistoryError("Dhan candle violates OHLC price bounds")
+        _validate_candle(candle)
         candles.append(candle)
 
     candles.sort(key=lambda candle: candle.timestamp)
@@ -95,15 +105,17 @@ def _parse_columnar(payload: object, trading_date: date, *, filter_date: bool = 
 def _previous_daily_candles(payload: object, trading_date: date) -> tuple[Candle, ...]:
     candles = _parse_columnar(payload, trading_date, filter_date=False)
     candles = tuple(c for c in candles if c.timestamp.date() < trading_date)
-    dates = [c.timestamp.date() for c in candles]
-    if len(set(dates)) != len(dates):
-        raise CandleHistoryError("Dhan returned duplicate daily candle dates")
+    if len(candles) < PREVIOUS_DAILY_CANDLE_COUNT:
+        raise CandleHistoryError(
+            f"Dhan returned only {len(candles)} previous daily candles; "
+            f"{PREVIOUS_DAILY_CANDLE_COUNT} are required"
+        )
     return candles[-PREVIOUS_DAILY_CANDLE_COUNT:]
 
 
-def _previous_day(candles: tuple[Candle, ...]) -> tuple[float | None, float | None, float | None]:
+def _previous_day(candles: tuple[Candle, ...]) -> tuple[float, float, float]:
     if not candles:
-        return None, None, None
+        raise CandleHistoryError("Previous daily candle history is empty")
     day = candles[-1]
     return day.high, day.low, day.close
 
@@ -124,18 +136,21 @@ def acquire_stock_session_history(
 
     current = (now or datetime.now(IST)).astimezone(IST)
     session_start = datetime.combine(trading_date, MARKET_OPEN, tzinfo=IST)
-    session_end = min(current, datetime.combine(trading_date, MARKET_CLOSE, tzinfo=IST))
-    if session_end < session_start:
-        session_end = session_start
+    session_close = datetime.combine(trading_date, MARKET_CLOSE, tzinfo=IST)
+    session_end = min(max(current, session_start), session_close)
 
     fetch_intraday = intraday_fetcher or client.intraday
     series: dict[int, tuple[Candle, ...]] = {}
     for interval in SUPPORTED_INTERVALS:
         payload = fetch_intraday(instrument.security_id, interval, session_start, session_end)
-        series[interval] = _parse_columnar(payload, trading_date)
+        candles = _parse_columnar(payload, trading_date)
+        for candle in candles:
+            if not (MARKET_OPEN <= candle.timestamp.timetz().replace(tzinfo=None) <= MARKET_CLOSE):
+                raise CandleHistoryError("Dhan returned an intraday candle outside NSE session")
+        series[interval] = candles
 
     fetch_daily = daily_fetcher or client.historical_daily
-    previous_start = trading_date - timedelta(days=60)
+    previous_start = trading_date - timedelta(days=90)
     daily_payload = fetch_daily(
         instrument.security_id,
         previous_start.isoformat(),
