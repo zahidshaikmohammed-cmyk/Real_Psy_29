@@ -50,7 +50,10 @@ def test_calculates_core_indicators_after_required_warmup():
     assert result[8].ema9 is not None
     assert result[18].ema20 is None
     assert result[19].ema20 is not None
-    assert result[13].rsi14 is not None
+    # RSI(14) requires 14 price changes, therefore its first valid point is index 14.
+    assert result[13].rsi14 is None
+    assert result[14].rsi14 is not None
+    assert result[13].atr14 is None
     assert result[14].atr14 is not None
     assert result[33].macd_signal is not None
     assert result[19].volume_sma20 is not None
