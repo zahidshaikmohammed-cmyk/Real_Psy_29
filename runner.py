@@ -17,10 +17,7 @@ CHECKPOINT_SECONDS = 60.0
 def _snapshot() -> tuple[str | None, dict]:
     with main.lock:
         trading_date = main.state.get("trading_date")
-        stocks = {
-            symbol: main.clean_stock(payload)
-            for symbol, payload in main.state.get("stocks", {}).items()
-        }
+        stocks = {symbol: main.clean_stock(payload) for symbol, payload in main.state.get("stocks", {}).items()}
     return trading_date, stocks
 
 
@@ -62,12 +59,7 @@ def _seed_live_state(token: str, security_map: dict[str, str]) -> None:
                 "symbol": symbol,
                 "security_id": security_map[symbol],
                 "current_price": q.get("current"),
-                "ohlc": {
-                    "open": q.get("open"),
-                    "high": q.get("high"),
-                    "low": q.get("low"),
-                    "close": q.get("close"),
-                },
+                "ohlc": {"open": q.get("open"), "high": q.get("high"), "low": q.get("low"), "close": q.get("close")},
                 "session_high": q.get("high"),
                 "session_low": q.get("low"),
                 "previous_day": {"high": None, "low": None, "close": None},
@@ -94,12 +86,23 @@ def _restore_checkpoint_if_needed(trading_date: str) -> None:
         return
     with main.lock:
         for symbol, payload in saved.items():
-            if symbol not in main.STOCKS:
+            if symbol not in main.STOCKS or not isinstance(payload, dict):
                 continue
             current = main.state["stocks"].get(symbol)
-            # Only use durable data as a fallback. Fresh live state remains authoritative.
-            if not current or current.get("current_price") is None:
+            if not current:
                 main.state["stocks"][symbol] = payload
+                continue
+            # Preserve the fresh quote, but restore durable candle/history state.
+            saved_candles = payload.get("candles")
+            if isinstance(saved_candles, dict):
+                current["candles"] = saved_candles
+                current["_one_min"] = list(saved_candles.get("1m", []))
+            for key in ("previous_day", "vwap", "ema9", "ema20", "opening_range", "structure", "session_high", "session_low"):
+                if key in payload:
+                    current[key] = payload[key]
+            current["_volume_anchor"] = None
+            if current.get("current_price") is None and payload.get("current_price") is not None:
+                current["current_price"] = payload["current_price"]
     main.log.info("Intraday Postgres recovery loaded %s/%s saved stocks", len(saved), len(main.STOCKS))
 
 
@@ -121,14 +124,7 @@ def _backfill_worker(token: str, security_map: dict[str, str]) -> None:
                 live_volume = s.get("volume")
                 live_last_tick = s.get("last_tick")
                 live_status = s.get("data_source_status")
-            main.rebuild_stock(symbol, one_min, {
-                "current": live_price,
-                "open": live_ohlc.get("open"),
-                "high": live_ohlc.get("high"),
-                "low": live_ohlc.get("low"),
-                "close": live_ohlc.get("close"),
-                "volume": live_volume,
-            }, prev)
+            main.rebuild_stock(symbol, one_min, {"current": live_price, "open": live_ohlc.get("open"), "high": live_ohlc.get("high"), "low": live_ohlc.get("low"), "close": live_ohlc.get("close"), "volume": live_volume}, prev)
             with main.lock:
                 s = main.state["stocks"].get(symbol)
                 if s:
@@ -137,7 +133,6 @@ def _backfill_worker(token: str, security_map: dict[str, str]) -> None:
             time.sleep(0.22)
         except Exception as exc:
             main.log.exception("Background backfill failed for %s: %s", symbol, exc)
-
     _checkpoint(force=True)
 
 
@@ -150,26 +145,16 @@ def _supervisor() -> None:
                     main.state["market_session_status"] = main.session_status(now)
                 time.sleep(5)
                 continue
-
             token, expiry = main.generate_access_token()
             with main.lock:
                 main.state["access_token_expiry"] = expiry
                 main.state["market_session_status"] = "OPEN"
                 main.state["source_status"] = "CONNECTING"
-
             security_map = main.load_security_map()
             _seed_live_state(token, security_map)
             _restore_checkpoint_if_needed(now.date().isoformat())
-            threading.Thread(
-                target=_backfill_worker,
-                args=(token, security_map),
-                daemon=True,
-                name="psy29-backfill",
-            ).start()
-
-            asyncio_runner = lambda: main.asyncio.run(main.websocket_loop(token))
-            asyncio_runner()
-
+            threading.Thread(target=_backfill_worker, args=(token, security_map), daemon=True, name="psy29-backfill").start()
+            main.asyncio.run(main.websocket_loop(token))
             _checkpoint(force=True)
             with main.lock:
                 main.state["source_status"] = "POST_CLOSE" if not main.in_session(main.now_ist()) else "RECONNECTING"
