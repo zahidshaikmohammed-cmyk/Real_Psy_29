@@ -9,6 +9,8 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -18,27 +20,6 @@ jobs:
           python-version: "3.12"
           cache: pip
       - name: Install dependencies
-        shell: bash
-        run: |
-          set +e
-          python -m pip install -r requirements.txt 2>&1 | tee install-output.txt
-          status=${PIPESTATUS[0]}
-          echo "PIP_EXIT_CODE=$status" >> install-output.txt
-          exit "$status"
-      - name: Run test suite
-        shell: bash
-        run: |
-          set +e
-          python -m pytest -q -rA 2>&1 | tee pytest-output.txt
-          status=${PIPESTATUS[0]}
-          echo "PYTEST_EXIT_CODE=$status" >> pytest-output.txt
-          exit "$status"
-      - name: Upload diagnostics
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: pytest-diagnostics
-          path: |
-            install-output.txt
-            pytest-output.txt
-          if-no-files-found: ignore
+        run: python -m pip install -r requirements.txt
+      - name: Run complete pytest suite
+        run: python -m pytest -q -rA
