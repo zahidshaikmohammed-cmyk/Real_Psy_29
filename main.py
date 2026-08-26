@@ -16,6 +16,8 @@ import websockets
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
+from psy29.normalized_api import normalize_market
+
 IST = timezone(timedelta(hours=5, minutes=30))
 MARKET_OPEN = (9, 15)
 MARKET_CLOSE = (15, 15)
@@ -511,16 +513,16 @@ def health():
 @app.get("/data")
 def data():
     with lock:
-        payload = {
+        raw = {
             "service": "PSY29 Live Data",
             "timestamp": now_ist().isoformat(),
             "trading_date": state["trading_date"],
             "market_session_status": state["market_session_status"],
             "data_source_status": state["source_status"],
             "stocks_expected": 29,
-            "stocks_loaded": len(state["stocks"]),
             "stocks": {k: clean_stock(v) for k, v in state["stocks"].items()},
         }
+    payload = normalize_market(raw)
     return JSONResponse(payload)
 
 
