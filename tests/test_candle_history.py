@@ -37,14 +37,10 @@ def daily_payload(count=30):
     }
 
 
-def fetcher(_security_id, _interval, _start, _end):
-    return candle_payload()
-
-
 def test_acquires_genuine_timeframes_and_30_previous_daily_candles():
     class Client:
         def intraday(self, *args):
-            return fetcher(*args)
+            return candle_payload()
 
         def historical_daily(self, *args):
             return daily_payload()
@@ -95,6 +91,21 @@ def test_rejects_duplicate_daily_dates():
             return rows
 
     with pytest.raises(CandleHistoryError):
+        acquire_stock_session_history(
+            Client(), registry(), "NESTLEIND",
+            now=datetime(2026, 8, 26, 10, 0, tzinfo=IST),
+        )
+
+
+def test_rejects_incomplete_previous_daily_history():
+    class Client:
+        def intraday(self, *args):
+            return candle_payload()
+
+        def historical_daily(self, *args):
+            return daily_payload(29)
+
+    with pytest.raises(CandleHistoryError, match="30 are required"):
         acquire_stock_session_history(
             Client(), registry(), "NESTLEIND",
             now=datetime(2026, 8, 26, 10, 0, tzinfo=IST),
