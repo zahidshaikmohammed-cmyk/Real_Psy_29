@@ -32,6 +32,27 @@ def validate_candle(candle: Candle) -> None:
         raise CandleIntegrityError("Candle volume cannot be negative")
 
 
+def _same_candle(left: Candle, right: Candle) -> bool:
+    return (
+        left.timestamp == right.timestamp
+        and left.open == right.open
+        and left.high == right.high
+        and left.low == right.low
+        and left.close == right.close
+        and left.volume == right.volume
+    )
+
+
+def _find_missing(candles: tuple[Candle, ...], interval_minutes: int) -> list[datetime]:
+    missing: list[datetime] = []
+    for previous, current in zip(candles, candles[1:]):
+        expected = previous.timestamp + timedelta(minutes=interval_minutes)
+        while expected < current.timestamp:
+            missing.append(expected)
+            expected += timedelta(minutes=interval_minutes)
+    return missing
+
+
 def reconcile_candles(
     existing: tuple[Candle, ...],
     incoming: tuple[Candle, ...],
@@ -52,31 +73,33 @@ def reconcile_candles(
         if last_timestamp is not None and candle.timestamp < last_timestamp:
             out_of_order_count += 1
         last_timestamp = candle.timestamp if last_timestamp is None else max(last_timestamp, candle.timestamp)
-        if candle.timestamp in accepted:
+
+        previous = accepted.get(candle.timestamp)
+        if previous is not None:
+            if not _same_candle(previous, candle):
+                raise CandleIntegrityError(
+                    f"Conflicting candle values for timestamp {candle.timestamp.isoformat()}"
+                )
             duplicate_count += 1
             continue
         accepted[candle.timestamp] = candle
 
     ordered = tuple(accepted[key] for key in sorted(accepted))
-    missing: list[datetime] = []
-    for previous, current in zip(ordered, ordered[1:]):
-        expected = previous.timestamp + timedelta(minutes=interval_minutes)
-        while expected < current.timestamp:
-            missing.append(expected)
-            expected += timedelta(minutes=interval_minutes)
+    missing = _find_missing(ordered, interval_minutes)
 
     if missing and fetch_missing is not None:
         recovered = fetch_missing(missing[0], missing[-1])
         for candle in recovered:
             validate_candle(candle)
-            accepted[candle.timestamp] = candle
+            previous = accepted.get(candle.timestamp)
+            if previous is not None and not _same_candle(previous, candle):
+                raise CandleIntegrityError(
+                    f"Recovery returned conflicting candle for {candle.timestamp.isoformat()}"
+                )
+            if previous is None:
+                accepted[candle.timestamp] = candle
         ordered = tuple(accepted[key] for key in sorted(accepted))
-        missing = []
-        for previous, current in zip(ordered, ordered[1:]):
-            expected = previous.timestamp + timedelta(minutes=interval_minutes)
-            while expected < current.timestamp:
-                missing.append(expected)
-                expected += timedelta(minutes=interval_minutes)
+        missing = _find_missing(ordered, interval_minutes)
 
     return ReconciliationResult(
         candles=ordered,
