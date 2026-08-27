@@ -22,17 +22,14 @@ def valid_rows(count=15):
 
 
 def test_one_zero_volume_candle_is_quarantined_and_stock_survives():
-    rows = valid_rows(15)
-    rows.insert(5, candle(20, volume=0))
+    rows = valid_rows(15) + [candle(30, volume=0)]
     result = validate_intraday_rows(rows, TRADING_DATE)
     assert len(result) == 15
     assert all(row["volume"] > 0 for row in result)
 
 
 def test_multiple_zero_volume_candles_survive_when_sufficient_history_remains():
-    rows = valid_rows(17)
-    rows.insert(5, candle(20, volume=0))
-    rows.insert(10, candle(25, volume=-1))
+    rows = valid_rows(17) + [candle(32, volume=0), candle(33, volume=-1)]
     result = validate_intraday_rows(rows, TRADING_DATE)
     assert len(result) == 17
     assert all(row["volume"] > 0 for row in result)
@@ -51,28 +48,28 @@ def test_insufficient_valid_candles_fail_after_quarantine():
 
 
 def test_impossible_ohlc_remains_hard_failure():
-    row = candle(15)
+    row = candle(29)
     row["high"] = row["open"] - 1
     with pytest.raises(DataIntegrityError, match="invalid OHLC bounds"):
         validate_intraday_rows(valid_rows(14) + [row], TRADING_DATE)
 
 
 def test_nan_price_remains_hard_failure():
-    row = candle(15)
+    row = candle(29)
     row["high"] = math.nan
     with pytest.raises(DataIntegrityError, match="non-finite/out-of-range equity price"):
         validate_intraday_rows(valid_rows(14) + [row], TRADING_DATE)
 
 
 def test_infinity_price_remains_hard_failure():
-    row = candle(15)
+    row = candle(29)
     row["low"] = math.inf
     with pytest.raises(DataIntegrityError, match="non-finite/out-of-range equity price"):
         validate_intraday_rows(valid_rows(14) + [row], TRADING_DATE)
 
 
 def test_duplicate_candles_are_hard_failure():
-    rows = valid_rows(14) + [candle(28), candle(28)]
+    rows = valid_rows(14) + [candle(29), candle(29)]
     with pytest.raises(DataIntegrityError, match="duplicate candle"):
         validate_intraday_rows(rows, TRADING_DATE)
 
