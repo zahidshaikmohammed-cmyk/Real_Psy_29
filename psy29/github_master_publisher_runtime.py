@@ -56,9 +56,11 @@ def _current(token: str):
 def publish_once() -> bool:
     token = os.getenv("GITHUB_LIVE_DATA_TOKEN")
     if not token:
+        LOGGER.warning("GitHub master publisher: token_present=false")
         return False
     payload = _payload()
     if payload is None:
+        LOGGER.info("GitHub master publisher: validated_payload=false")
         return False
     content = _bytes(payload)
     sha, existing = _current(token)
@@ -85,6 +87,8 @@ def _worker():
 def start():
     global _started
     if _started or not os.getenv("GITHUB_LIVE_DATA_TOKEN"):
+        LOGGER.warning("GitHub master publisher not started: token_present=%s", bool(os.getenv("GITHUB_LIVE_DATA_TOKEN")))
         return
     _started = True
+    LOGGER.info("GitHub master publisher started: interval=%ss", int(INTERVAL_SECONDS))
     threading.Thread(target=_worker, name="psy29-github-master", daemon=True).start()
