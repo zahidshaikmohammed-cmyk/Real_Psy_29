@@ -24,7 +24,7 @@ def _finite_positive(value: object) -> float:
 
 
 def _normalize_epoch_seconds(value: object) -> int:
-    """Normalize epoch units without changing Dhan's documented seconds format."""
+    """Normalize epoch units without changing valid Unix-second timestamps."""
     try:
         raw = int(value)
     except (TypeError, ValueError, OverflowError) as exc:
@@ -107,6 +107,14 @@ def validate_quote(quote: object) -> dict:
 
 
 def validate_tick(ltp: object, volume: object, ltt_epoch: object, day_open: object, day_high: object, day_low: object, now: datetime, previous_volume: object = None) -> tuple[float, int, int, float, float, float]:
+    """Validate the market values and use packet receipt time for freshness.
+
+    Dhan documents LTT as Unix epoch seconds, but the feed can emit a stale or
+    otherwise unusable LTT while the quote packet itself is valid. The packet
+    receipt is the authoritative freshness clock for this process. We therefore
+    reject malformed values but never discard an otherwise valid live quote only
+    because its embedded LTT falls outside the current NSE session.
+    """
     price = _finite_positive(ltp)
     opn = _finite_positive(day_open)
     high = _finite_positive(day_high)
@@ -118,25 +126,25 @@ def validate_tick(ltp: object, volume: object, ltt_epoch: object, day_open: obje
     ltt = _normalize_epoch_seconds(ltt_epoch)
     if vol < 0 or high < low or high < opn or low > opn or not low <= price <= high:
         raise DataIntegrityError("invalid live tick market values")
+
+    # Decode LTT only for diagnostics. Do not use it as the freshness clock.
+    # Dhan's feed is received over a live WebSocket; receipt time is the time
+    # this process actually observed the packet.
     try:
-        ts = datetime.fromtimestamp(ltt, now.tzinfo)
+        embedded_ts = datetime.fromtimestamp(ltt, now.tzinfo)
     except (OverflowError, OSError, ValueError) as exc:
         raise DataIntegrityError("invalid tick timestamp") from exc
 
-    # Dhan's LTT is the trade timestamp. For a valid quote packet whose LTT is
-    # stale/outside the current session, use the packet receipt time as the
-    # freshness timestamp rather than poisoning the live state with a bogus
-    # historical/future candle timestamp. This fallback is bounded to a day.
-    if not (IST_OPEN <= ts.timetz().replace(tzinfo=None) < IST_CLOSE) or ts.date() != now.date():
-        age = (now - ts).total_seconds()
-        if 0 <= age <= 86400 and ts <= now:
-            ltt = int(now.timestamp())
-            ts = now
-        else:
-            raise DataIntegrityError("live tick timestamp outside current NSE session")
+    receipt = now
+    if not (IST_OPEN <= receipt.timetz().replace(tzinfo=None) < IST_CLOSE) or receipt.date() != now.date():
+        raise DataIntegrityError("tick received outside current NSE session")
 
-    if ts > now + timedelta(seconds=5):
-        raise DataIntegrityError("live tick timestamp is in the future")
+    # Return receipt epoch so downstream state and last_tick represent the
+    # actual freshness of the live packet, not an unreliable embedded LTT.
+    receipt_epoch = int(receipt.timestamp())
+    if embedded_ts > now + timedelta(seconds=5):
+        # Future LTT is ignored rather than allowed to poison state.
+        pass
     if previous_volume is not None and vol < int(previous_volume):
         raise DataIntegrityError("live cumulative volume moved backwards")
-    return price, vol, ltt, opn, high, low
+    return price, vol, receipt_epoch, opn, high, low
