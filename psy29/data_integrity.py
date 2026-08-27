@@ -5,6 +5,8 @@ from datetime import datetime, time, timedelta
 
 IST_OPEN = time(9, 15)
 IST_CLOSE = time(15, 15)
+MIN_REASONABLE_EQUITY_PRICE = 0.01
+MAX_REASONABLE_EQUITY_PRICE = 10_000_000.0
 
 
 class DataIntegrityError(ValueError):
@@ -16,8 +18,8 @@ def _finite_positive(value: object) -> float:
         number = float(value)
     except (TypeError, ValueError, OverflowError) as exc:
         raise DataIntegrityError("non-numeric price") from exc
-    if not math.isfinite(number) or number <= 0:
-        raise DataIntegrityError("non-finite/non-positive price")
+    if not math.isfinite(number) or not (MIN_REASONABLE_EQUITY_PRICE <= number <= MAX_REASONABLE_EQUITY_PRICE):
+        raise DataIntegrityError("non-finite/out-of-range equity price")
     return number
 
 
