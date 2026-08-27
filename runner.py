@@ -200,7 +200,6 @@ def _restore_checkpoint_if_needed(trading_date: str) -> None:
                         current[key] = payload[key]
             elif saved_candles:
                 rejected += 1
-            # Never restore persisted current_price/ohlc/last_tick over fresh Dhan state.
             current["_volume_anchor"] = None
     if rejected:
         main.log.warning("Rejected %s/%s persisted candle sets as invalid; fresh Dhan history required", rejected, len(saved))
@@ -333,15 +332,25 @@ def _machine_payload() -> dict:
                         if previous is not None and ts <= previous:
                             raise DataIntegrityError(f"{tf} candle order invalid")
                         previous = ts
-            if stock.get("current_price") is not None:
-                validate_quote({
-                    "current": stock.get("current_price"),
-                    "open": stock.get("ohlc", {}).get("open"),
-                    "high": stock.get("ohlc", {}).get("high"),
-                    "low": stock.get("ohlc", {}).get("low"),
-                    "close": stock.get("ohlc", {}).get("close"),
-                    "volume": stock.get("volume"),
-                })
+            one_min = candles.get("1m", [])
+            if one_min:
+                expected_vwap = main.calc_vwap(one_min)
+                expected_ema9 = main.calc_ema(one_min, 9)
+                expected_ema20 = main.calc_ema(one_min, 20)
+                for key, expected in (("vwap", expected_vwap), ("ema9", expected_ema9), ("ema20", expected_ema20)):
+                    supplied = stock.get(key)
+                    if supplied is None or expected is None or not math.isfinite(float(supplied)) or abs(float(supplied) - expected) > max(0.01, expected * 0.0001):
+                        raise DataIntegrityError(f"{key} does not match validated candles")
+            if stock.get("current_price") is None:
+                raise DataIntegrityError("current_price missing")
+            validate_quote({
+                "current": stock.get("current_price"),
+                "open": stock.get("ohlc", {}).get("open"),
+                "high": stock.get("ohlc", {}).get("high"),
+                "low": stock.get("ohlc", {}).get("low"),
+                "close": stock.get("ohlc", {}).get("close"),
+                "volume": stock.get("volume"),
+            })
             if stock.get("last_tick"):
                 lt = datetime.fromisoformat(stock["last_tick"])
                 if lt.date().isoformat() != raw["trading_date"]:
