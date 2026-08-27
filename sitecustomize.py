@@ -148,17 +148,18 @@ def _start_psy29_github_master_publisher():
     if not os.getenv("GITHUB_LIVE_DATA_TOKEN"):
         return
     try:
-        from psy29.github_master_publisher import start
+        from psy29.github_master_publisher_runtime import start
         start()
     except Exception:
         return
 
 
 def _github_master_bootstrap():
-    # Wait until runner.py is imported so the publisher consumes the existing
-    # validated machine payload rather than creating a second market-data path.
+    # Render starts runner.py as __main__, so wait for its machine payload rather
+    # than importing runner a second time.
     for _ in range(120):
-        if "runner" in sys.modules:
+        process = sys.modules.get("__main__")
+        if process is not None and hasattr(process, "_machine_payload"):
             _start_psy29_github_master_publisher()
             return
         time.sleep(0.5)
