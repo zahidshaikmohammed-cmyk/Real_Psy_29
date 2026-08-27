@@ -141,3 +141,26 @@ def _patched_start(self, *args, **kwargs):
 if not _PATCHED:
     threading.Thread.start = _patched_start
     _PATCHED = True
+
+
+def _start_psy29_github_master_publisher():
+    if not os.getenv("GITHUB_LIVE_DATA_TOKEN"):
+        return
+    try:
+        from psy29.github_master_publisher import start
+        start()
+    except Exception:
+        return
+
+
+def _github_master_bootstrap():
+    # Wait until runner.py is imported so the publisher consumes the existing
+    # validated machine payload rather than creating a second market-data path.
+    for _ in range(120):
+        if "runner" in sys.modules:
+            _start_psy29_github_master_publisher()
+            return
+        time.sleep(0.5)
+
+
+threading.Thread(target=_github_master_bootstrap, name="psy29-github-master-bootstrap", daemon=True).start()
