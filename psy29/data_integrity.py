@@ -122,8 +122,19 @@ def validate_tick(ltp: object, volume: object, ltt_epoch: object, day_open: obje
         ts = datetime.fromtimestamp(ltt, now.tzinfo)
     except (OverflowError, OSError, ValueError) as exc:
         raise DataIntegrityError("invalid tick timestamp") from exc
-    if ts.date() != now.date() or not (IST_OPEN <= ts.timetz().replace(tzinfo=None) < IST_CLOSE):
-        raise DataIntegrityError("live tick timestamp outside current NSE session")
+
+    # Dhan's LTT is the trade timestamp. For a valid quote packet whose LTT is
+    # stale/outside the current session, use the packet receipt time as the
+    # freshness timestamp rather than poisoning the live state with a bogus
+    # historical/future candle timestamp. This fallback is bounded to a day.
+    if not (IST_OPEN <= ts.timetz().replace(tzinfo=None) < IST_CLOSE) or ts.date() != now.date():
+        age = (now - ts).total_seconds()
+        if 0 <= age <= 86400 and ts <= now:
+            ltt = int(now.timestamp())
+            ts = now
+        else:
+            raise DataIntegrityError("live tick timestamp outside current NSE session")
+
     if ts > now + timedelta(seconds=5):
         raise DataIntegrityError("live tick timestamp is in the future")
     if previous_volume is not None and vol < int(previous_volume):
