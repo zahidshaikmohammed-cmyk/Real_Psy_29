@@ -66,22 +66,39 @@ def validate_ohlcv_row(row: dict, trading_date: str, *, session_only: bool = Tru
 
 
 def validate_intraday_rows(rows: object, trading_date: str) -> list[dict]:
+    """Validate an intraday stream while isolating individual corrupt rows.
+
+    Dhan history can occasionally contain an isolated malformed OHLC row. A
+    single bad row must never poison an otherwise valid session. Such a row is
+    rejected and omitted. Ordering/duplicate integrity is still enforced on the
+    retained rows, and a minimum usable history is required.
+    """
     if not isinstance(rows, list) or not rows:
         raise DataIntegrityError("empty intraday history")
     valid: list[dict] = []
-    previous: datetime | None = None
     seen: set[int] = set()
+    rejected = 0
     for row in rows:
         if not isinstance(row, dict):
-            raise DataIntegrityError("intraday row is not an object")
-        clean = validate_ohlcv_row(row, trading_date)
-        ts = datetime.fromisoformat(str(clean["timestamp"]))
-        epoch = int(clean["epoch"])
-        if epoch in seen or (previous is not None and ts <= previous):
+            rejected += 1
+            continue
+        try:
+            clean = validate_ohlcv_row(row, trading_date)
+            epoch = int(clean["epoch"])
+            if epoch in seen:
+                rejected += 1
+                continue
+            seen.add(epoch)
+            valid.append(clean)
+        except (DataIntegrityError, KeyError, TypeError, ValueError, OverflowError):
+            rejected += 1
+            continue
+    valid.sort(key=lambda r: int(r["epoch"]))
+    if len(valid) < 15:
+        raise DataIntegrityError(f"insufficient valid intraday history: {len(valid)} rows")
+    for i in range(1, len(valid)):
+        if int(valid[i]["epoch"]) <= int(valid[i - 1]["epoch"]):
             raise DataIntegrityError("duplicate/out-of-order candle")
-        seen.add(epoch)
-        previous = ts
-        valid.append(clean)
     return valid
 
 
@@ -107,14 +124,7 @@ def validate_quote(quote: object) -> dict:
 
 
 def validate_tick(ltp: object, volume: object, ltt_epoch: object, day_open: object, day_high: object, day_low: object, now: datetime, previous_volume: object = None) -> tuple[float, int, int, float, float, float]:
-    """Validate the market values and use packet receipt time for freshness.
-
-    Dhan documents LTT as Unix epoch seconds, but the feed can emit a stale or
-    otherwise unusable LTT while the quote packet itself is valid. The packet
-    receipt is the authoritative freshness clock for this process. We therefore
-    reject malformed values but never discard an otherwise valid live quote only
-    because its embedded LTT falls outside the current NSE session.
-    """
+    """Validate market values and use packet receipt time for freshness."""
     price = _finite_positive(ltp)
     opn = _finite_positive(day_open)
     high = _finite_positive(day_high)
@@ -126,24 +136,15 @@ def validate_tick(ltp: object, volume: object, ltt_epoch: object, day_open: obje
     ltt = _normalize_epoch_seconds(ltt_epoch)
     if vol < 0 or high < low or high < opn or low > opn or not low <= price <= high:
         raise DataIntegrityError("invalid live tick market values")
-
-    # Decode LTT only for diagnostics. Do not use it as the freshness clock.
-    # Dhan's feed is received over a live WebSocket; receipt time is the time
-    # this process actually observed the packet.
     try:
         embedded_ts = datetime.fromtimestamp(ltt, now.tzinfo)
     except (OverflowError, OSError, ValueError) as exc:
         raise DataIntegrityError("invalid tick timestamp") from exc
-
     receipt = now
     if not (IST_OPEN <= receipt.timetz().replace(tzinfo=None) < IST_CLOSE) or receipt.date() != now.date():
         raise DataIntegrityError("tick received outside current NSE session")
-
-    # Return receipt epoch so downstream state and last_tick represent the
-    # actual freshness of the live packet, not an unreliable embedded LTT.
     receipt_epoch = int(receipt.timestamp())
     if embedded_ts > now + timedelta(seconds=5):
-        # Future LTT is ignored rather than allowed to poison state.
         pass
     if previous_volume is not None and vol < int(previous_volume):
         raise DataIntegrityError("live cumulative volume moved backwards")
