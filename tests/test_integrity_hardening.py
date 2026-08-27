@@ -30,7 +30,7 @@ def test_non_chronological_candles_are_hard_failure():
 
 def test_future_candle_is_hard_failure():
     row = candle(15)
-    row["timestamp"] = "2026-08-27T23:00:00+05:30"
+    row["timestamp"] = "2026-08-27T12:00:00+05:30"
     row["epoch"] = int(datetime.fromisoformat(row["timestamp"]).timestamp())
     with pytest.raises(DataIntegrityError, match="future candle"):
         validate_intraday_rows([row] * 15, TRADING_DATE)
@@ -60,5 +60,10 @@ def test_dhan_websocket_packet_uses_canonical_offsets():
     struct.pack_into("<f", packet, 46, 1880.0)
 
     parsed = parse_quote_packet(bytes(packet))
-    assert parsed == (123456, pytest.approx(1900.5), 1000, 1787802360,
-                      pytest.approx(1890.0), pytest.approx(1910.0), pytest.approx(1880.0))
+    assert parsed[0] == 123456
+    assert parsed[1] == pytest.approx(1900.5)
+    assert parsed[2] == 1000
+    assert parsed[3] == 1787802360
+    assert parsed[4] == pytest.approx(1890.0)
+    assert parsed[5] == pytest.approx(1910.0)
+    assert parsed[6] == pytest.approx(1880.0)
