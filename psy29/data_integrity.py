@@ -23,6 +23,24 @@ def _finite_positive(value: object) -> float:
     return number
 
 
+def _normalize_epoch_seconds(value: object) -> int:
+    """Normalize epoch units without changing Dhan's documented seconds format."""
+    try:
+        raw = int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise DataIntegrityError("invalid tick timestamp") from exc
+    if raw <= 0:
+        raise DataIntegrityError("invalid tick timestamp")
+    magnitude = abs(raw)
+    if magnitude >= 10**18:
+        raw //= 10**9
+    elif magnitude >= 10**15:
+        raw //= 10**6
+    elif magnitude >= 10**12:
+        raw //= 10**3
+    return raw
+
+
 def validate_ohlcv_row(row: dict, trading_date: str, *, session_only: bool = True) -> dict:
     try:
         ts = datetime.fromisoformat(str(row["timestamp"]))
@@ -95,12 +113,15 @@ def validate_tick(ltp: object, volume: object, ltt_epoch: object, day_open: obje
     low = _finite_positive(day_low)
     try:
         vol = int(volume)
-        ltt = int(ltt_epoch)
     except (TypeError, ValueError, OverflowError) as exc:
         raise DataIntegrityError("invalid tick volume/timestamp") from exc
+    ltt = _normalize_epoch_seconds(ltt_epoch)
     if vol < 0 or high < low or high < opn or low > opn or not low <= price <= high:
         raise DataIntegrityError("invalid live tick market values")
-    ts = datetime.fromtimestamp(ltt, now.tzinfo)
+    try:
+        ts = datetime.fromtimestamp(ltt, now.tzinfo)
+    except (OverflowError, OSError, ValueError) as exc:
+        raise DataIntegrityError("invalid tick timestamp") from exc
     if ts.date() != now.date() or not (IST_OPEN <= ts.timetz().replace(tzinfo=None) < IST_CLOSE):
         raise DataIntegrityError("live tick timestamp outside current NSE session")
     if ts > now + timedelta(seconds=5):
