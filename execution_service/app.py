@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import threading
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -16,7 +17,15 @@ REFRESH_SECONDS = 45.0
 TIMEOUT_SECONDS = 15.0
 
 app = FastAPI(title="PSY29 Execution Enrichment", version="1.0.0")
-_cache: dict[str, Any] = {"payload": None, "fetched_at": None, "error_code": None, "error_message": None}
+_cache: dict[str, Any] = {
+    "payload": None,
+    "fetched_at_monotonic": None,
+    "last_successful_fetch": None,
+    "error_code": None,
+    "error_message": None,
+}
+_cache_lock = threading.RLock()
+_fetch_inflight: threading.Event | None = None
 
 
 def _utc_now() -> str:
@@ -64,13 +73,65 @@ def _source_safe(payload: dict[str, Any]):
     return True, None, None
 
 
+def _cache_is_fresh(now: float) -> bool:
+    fetched = _cache["fetched_at_monotonic"]
+    if fetched is None:
+        return False
+    return now - fetched < REFRESH_SECONDS
+
+
+def _cached_result():
+    return copy.deepcopy(_cache["payload"]), _cache["error_code"], _cache["error_message"]
+
+
 def _get_cached_or_fetch():
-    now = time.monotonic()
-    if _cache["payload"] is not None and _cache["fetched_at"] is not None and now - _cache["fetched_at"] < REFRESH_SECONDS:
-        return copy.deepcopy(_cache["payload"]), _cache["error_code"], _cache["error_message"]
-    payload, code, message = _fetch_source()
-    _cache.update(payload=copy.deepcopy(payload) if payload is not None else None, fetched_at=now, error_code=code, error_message=message)
-    return copy.deepcopy(payload), code, message
+    """Return one cached result, with at most one upstream fetch in flight."""
+    global _fetch_inflight
+    with _cache_lock:
+        if _cache_is_fresh(time.monotonic()):
+            return _cached_result()
+        if _fetch_inflight is None:
+            event = threading.Event()
+            _fetch_inflight = event
+            owner = True
+        else:
+            event = _fetch_inflight
+            owner = False
+    if not owner:
+        event.wait(timeout=TIMEOUT_SECONDS + 5.0)
+        with _cache_lock:
+            return _cached_result()
+    try:
+        payload, code, message = _fetch_source()
+        completed_monotonic = time.monotonic()
+        successful_fetch = _utc_now() if payload is not None and code is None else None
+        with _cache_lock:
+            _cache["payload"] = copy.deepcopy(payload) if payload is not None else None
+            _cache["fetched_at_monotonic"] = completed_monotonic
+            _cache["last_successful_fetch"] = successful_fetch
+            _cache["error_code"] = code
+            _cache["error_message"] = message
+            return _cached_result()
+    finally:
+        with _cache_lock:
+            event = _fetch_inflight
+            _fetch_inflight = None
+            if event is not None:
+                event.set()
+
+
+def _status_from_source(payload, code, message):
+    snap = _source_snapshot(payload)
+    if code:
+        enrichment_status, error_code, error_message = "SOURCE_UNAVAILABLE", code, message
+    elif payload:
+        safe, gate_code, gate_message = _source_safe(payload)
+        enrichment_status, error_code, error_message = (("AVAILABLE", None, None) if safe else ("BLOCKED_SOURCE_UNSAFE", gate_code, gate_message))
+    else:
+        enrichment_status, error_code, error_message = "SOURCE_UNAVAILABLE", "NO_SOURCE_FETCH", "No source payload fetched yet."
+    with _cache_lock:
+        last_successful_fetch = _cache["last_successful_fetch"]
+    return {"service": "PSY29 Execution Enrichment", "source_url": SOURCE_URL, "last_source_fetch": last_successful_fetch, **snap, "enrichment_status": enrichment_status, "error_code": error_code, "error_message": error_message}
 
 
 @app.get("/")
@@ -85,16 +146,8 @@ def health():
 
 @app.get("/status")
 def status():
-    payload = copy.deepcopy(_cache["payload"])
-    snap = _source_snapshot(payload)
-    if _cache["error_code"]:
-        enrichment_status, error_code, error_message = "SOURCE_UNAVAILABLE", _cache["error_code"], _cache["error_message"]
-    elif payload:
-        safe, gate_code, gate_message = _source_safe(payload)
-        enrichment_status, error_code, error_message = ("AVAILABLE", None, None) if safe else ("BLOCKED_SOURCE_UNSAFE", gate_code, gate_message)
-    else:
-        enrichment_status, error_code, error_message = "SOURCE_UNAVAILABLE", "NO_SOURCE_FETCH", "No source payload fetched yet."
-    return {"service": "PSY29 Execution Enrichment", "source_url": SOURCE_URL, "last_source_fetch": _cache["fetched_at"], **snap, "enrichment_status": enrichment_status, "error_code": error_code, "error_message": error_message}
+    payload, code, message = _get_cached_or_fetch()
+    return _status_from_source(payload, code, message)
 
 
 @app.get("/execution.json")
