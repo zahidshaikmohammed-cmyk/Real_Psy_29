@@ -238,3 +238,90 @@ def validate_tick(
     if previous_volume is not None and vol < int(previous_volume):
         raise DataIntegrityError("live cumulative volume moved backwards")
     return price, vol, receipt_epoch, opn, high, low
+
+
+# TEMPORARY SAFE QUOTE-BOUNDARY DIAGNOSTICS.
+# This instrumentation logs only market-data fields; credentials and auth headers
+# are never logged. It is intentionally installed at import time so runner.py
+# captures the wrapped Dhan REST adapter as its original fetch path.
+def _install_quote_boundary_diagnostics() -> None:
+    import logging
+    import sys
+
+    main = sys.modules.get("main")
+    if main is None or not hasattr(main, "dhan_post"):
+        return
+    if getattr(main, "_psy29_quote_diag_installed", False):
+        return
+
+    original_dhan_post = main.dhan_post
+    diag_log = logging.getLogger("psy29.quote_diagnostics")
+
+    def diagnostic_dhan_post(url, *, token, payload, client_id=None,
+                             kind="data", timeout=25, label="Dhan API"):
+        response = original_dhan_post(
+            url,
+            token=token,
+            payload=payload,
+            client_id=client_id,
+            kind=kind,
+            timeout=timeout,
+            label=label,
+        )
+        if label == "marketfeed:quote":
+            try:
+                body = response.json()
+                data = body.get("data") or {}
+                raw_quotes = data.get("NSE_EQ") or {}
+                requested_ids = [str(v) for v in payload.get("NSE_EQ", [])]
+                stock_names = list(getattr(main, "STOCKS", []))
+                request_symbol = {
+                    requested_ids[i]: stock_names[i]
+                    for i in range(min(len(requested_ids), len(stock_names)))
+                }
+                returned_ids = {str(k) for k in raw_quotes.keys()}
+                diag_log.warning(
+                    "QUOTE_BOUNDARY_REQUEST requested_count=%d returned_count=%d "
+                    "requested_ids=%s returned_ids=%s",
+                    len(requested_ids),
+                    len(returned_ids),
+                    requested_ids,
+                    sorted(returned_ids),
+                )
+                for sid in requested_ids:
+                    item = raw_quotes.get(sid)
+                    if item is None:
+                        item = raw_quotes.get(int(sid)) if sid.isdigit() else None
+                    symbol = request_symbol.get(sid, "UNKNOWN")
+                    if not isinstance(item, dict):
+                        diag_log.warning(
+                            "QUOTE_BOUNDARY symbol=%s security_id=%s returned=false "
+                            "raw_type=%s raw_quote=%r",
+                            symbol, sid, type(item).__name__, item,
+                        )
+                        continue
+                    ohlc = item.get("ohlc") if isinstance(item.get("ohlc"), dict) else {}
+                    safe = {
+                        "last_price": item.get("last_price"),
+                        "volume": item.get("volume"),
+                        "ohlc": {
+                            "open": ohlc.get("open"),
+                            "high": ohlc.get("high"),
+                            "low": ohlc.get("low"),
+                            "close": ohlc.get("close"),
+                        },
+                        "last_trade_time": item.get("last_trade_time"),
+                    }
+                    diag_log.warning(
+                        "QUOTE_BOUNDARY symbol=%s security_id=%s returned=true raw=%r",
+                        symbol, sid, safe,
+                    )
+            except Exception:
+                diag_log.exception("QUOTE_BOUNDARY diagnostic parse failure")
+        return response
+
+    main.dhan_post = diagnostic_dhan_post
+    main._psy29_quote_diag_installed = True
+
+
+_install_quote_boundary_diagnostics()
