@@ -92,15 +92,34 @@ def validate_intraday_rows(rows: object, trading_date: str) -> list[dict]:
     return valid
 
 
-def validate_quote(quote: object) -> dict:
-    """Validate a live quote and repair only contradictory aggregate OHLC.
+def validate_live_quote(quote: object) -> dict:
+    """Validate the point-in-time quote without trusting broker aggregate OHLC.
 
-    Dhan's aggregate quote occasionally arrives with a small internal OHLC
-    contradiction (for example open slightly above reported day-high). That
-    contradiction must not poison the public machine payload when the live LTP
-    itself is valid. We therefore normalize the session envelope from the
-    finite, plausible quote fields. Grossly implausible values are still
-    rejected rather than silently accepted.
+    Dhan's quote packet contains both LTP and an aggregate day OHLC snapshot.
+    The LTP and volume are independently useful live-feed fields, while the
+    session OHLC used by PSY29 is derived from validated 1-minute candles.
+    Therefore an internally contradictory broker aggregate OHLC must not be
+    promoted into the canonical session state.
+    """
+    if not isinstance(quote, dict):
+        raise DataIntegrityError("quote is not an object")
+    current = _finite_positive(quote.get("current"))
+    try:
+        volume = int(quote.get("volume") or 0)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise DataIntegrityError("invalid quote volume") from exc
+    if volume < 0:
+        raise DataIntegrityError("invalid quote volume")
+    return {"current": current, "volume": volume}
+
+
+def validate_quote(quote: object) -> dict:
+    """Strictly validate a complete quote snapshot.
+
+    This validator remains intentionally strict. It is used when a complete
+    OHLC snapshot is presented as a canonical quote. The live collector should
+    use validate_live_quote instead and derive session OHLC from validated
+    intraday candles.
     """
     if not isinstance(quote, dict):
         raise DataIntegrityError("quote is not an object")
@@ -121,36 +140,80 @@ def validate_quote(quote: object) -> dict:
         raise DataIntegrityError("invalid quote volume") from exc
     if volume < 0:
         raise DataIntegrityError("invalid quote OHLC/volume")
-
-    # Keep the quote anchored to the live price. A grossly distant field is
-    # treated as corruption; a small contradiction is repaired by taking the
-    # envelope of the plausible values. 50% is intentionally generous for an
-    # equity intraday feed while still excluding the scientific-notation garbage
-    # that previously appeared in this service.
-    anchor = current
-    plausible = []
-    for value in (opn, high, low):
-        if abs(value - anchor) / anchor <= 0.50:
-            plausible.append(value)
-    if len(plausible) < 2:
-        raise DataIntegrityError("quote OHLC values implausibly distant from current price")
-
-    session_high = max([anchor, *plausible])
-    session_low = min([anchor, *plausible])
-    normalized_open = min(max(opn, session_low), session_high)
+    if high < max(opn, current) or low > min(opn, current) or high < low:
+        raise DataIntegrityError("invalid quote OHLC bounds")
+    if close is not None and (high < close or low > close):
+        raise DataIntegrityError("invalid quote OHLC bounds")
 
     return {
         "current": current,
-        "open": normalized_open,
-        "high": session_high,
-        "low": session_low,
+        "open": opn,
+        "high": high,
+        "low": low,
         "close": close,
         "volume": volume,
     }
 
 
-def validate_tick(ltp: object, volume: object, ltt_epoch: object, day_open: object, day_high: object, day_low: object, now: datetime, previous_volume: object = None) -> tuple[float, int, int, float, float, float]:
-    """Validate market values and use packet receipt time for freshness."""
+def validate_live_tick(
+    ltp: object,
+    volume: object,
+    ltt_epoch: object,
+    now: datetime,
+    previous_volume: object = None,
+    *,
+    max_exchange_age_seconds: int = 300,
+) -> tuple[float, int, int]:
+    """Validate a live LTP using receipt time for liveness.
+
+    The broker's day-open/day-high/day-low fields are deliberately excluded
+    from this validation. They are not the canonical session object. Exchange
+    timestamp is used for chronology/freshness when plausible; packet receipt
+    time remains the authoritative liveness signal.
+    """
+    price = _finite_positive(ltp)
+    try:
+        vol = int(volume)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise DataIntegrityError("invalid tick volume") from exc
+    if vol < 0:
+        raise DataIntegrityError("invalid tick volume")
+    ltt = _normalize_epoch_seconds(ltt_epoch)
+    try:
+        embedded_ts = datetime.fromtimestamp(ltt, now.tzinfo)
+    except (OverflowError, OSError, ValueError) as exc:
+        raise DataIntegrityError("invalid tick timestamp") from exc
+    if embedded_ts > now + timedelta(seconds=5):
+        raise DataIntegrityError("future live tick")
+    if embedded_ts.date() != now.date():
+        raise DataIntegrityError("live tick timestamp outside current trading date")
+    if not (IST_OPEN <= embedded_ts.timetz().replace(tzinfo=None) < IST_CLOSE):
+        raise DataIntegrityError("live tick timestamp outside NSE session")
+    if (now - embedded_ts).total_seconds() > max_exchange_age_seconds:
+        raise DataIntegrityError("stale live tick")
+    if not (IST_OPEN <= now.timetz().replace(tzinfo=None) < IST_CLOSE):
+        raise DataIntegrityError("tick received outside current NSE session")
+    if previous_volume is not None and vol < int(previous_volume):
+        raise DataIntegrityError("live cumulative volume moved backwards")
+    return price, vol, ltt
+
+
+def validate_tick(
+    ltp: object,
+    volume: object,
+    ltt_epoch: object,
+    day_open: object,
+    day_high: object,
+    day_low: object,
+    now: datetime,
+    previous_volume: object = None,
+) -> tuple[float, int, int, float, float, float]:
+    """Strictly validate a complete broker tick packet.
+
+    Kept for tests and callers that explicitly require broker OHLC integrity.
+    The live collector uses validate_live_tick because broker aggregate OHLC is
+    not the canonical session OHLC source.
+    """
     price = _finite_positive(ltp)
     opn = _finite_positive(day_open)
     high = _finite_positive(day_high)
@@ -166,12 +229,12 @@ def validate_tick(ltp: object, volume: object, ltt_epoch: object, day_open: obje
         embedded_ts = datetime.fromtimestamp(ltt, now.tzinfo)
     except (OverflowError, OSError, ValueError) as exc:
         raise DataIntegrityError("invalid tick timestamp") from exc
+    if embedded_ts > now + timedelta(seconds=5):
+        raise DataIntegrityError("future live tick")
     receipt = now
     if not (IST_OPEN <= receipt.timetz().replace(tzinfo=None) < IST_CLOSE) or receipt.date() != now.date():
         raise DataIntegrityError("tick received outside current NSE session")
     receipt_epoch = int(receipt.timestamp())
-    if embedded_ts > now + timedelta(seconds=5):
-        pass
     if previous_volume is not None and vol < int(previous_volume):
         raise DataIntegrityError("live cumulative volume moved backwards")
     return price, vol, receipt_epoch, opn, high, low
