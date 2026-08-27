@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import csv
 import io
@@ -22,6 +24,12 @@ IST = timezone(timedelta(hours=5, minutes=30))
 MARKET_OPEN = (9, 15)
 MARKET_CLOSE = (15, 15)
 
+# Dhan V2 limits: Data APIs = 5 requests/sec; Quote APIs = 1 request/sec.
+# Keep a safety margin so startup/backfill never bursts over the broker limit.
+DATA_REQUEST_INTERVAL = 0.25
+QUOTE_REQUEST_INTERVAL = 1.05
+MAX_429_RETRIES = 6
+
 STOCKS = [
     "NESTLEIND", "VEDL", "ICICIPRULI", "KALYANKJIL", "KOTAKBANK",
     "BANDHANBNK", "BANKBARODA", "TITAN", "INFY", "DLF", "TCS",
@@ -41,6 +49,11 @@ log = logging.getLogger("psy29")
 
 app = FastAPI(title="PSY29 Live Data", version="1.0.0")
 lock = threading.RLock()
+data_rate_lock = threading.Lock()
+quote_rate_lock = threading.Lock()
+_last_data_request = 0.0
+_last_quote_request = 0.0
+
 state: dict[str, Any] = {
     "trading_date": None,
     "market_session_status": "UNKNOWN",
@@ -93,6 +106,59 @@ def dhan_headers(token: str, client_id: str | None = None):
     if client_id:
         h["client-id"] = client_id
     return h
+
+
+def _throttle(rate_lock: threading.Lock, interval: float, kind: str):
+    """Serialize requests of one Dhan API class and enforce a hard minimum gap."""
+    global _last_data_request, _last_quote_request
+    with rate_lock:
+        last = _last_data_request if kind == "data" else _last_quote_request
+        wait = interval - (time.monotonic() - last)
+        if wait > 0:
+            time.sleep(wait)
+        if kind == "data":
+            _last_data_request = time.monotonic()
+        else:
+            _last_quote_request = time.monotonic()
+
+
+def dhan_post(url: str, *, token: str, payload: dict, client_id: str | None = None,
+              kind: str = "data", timeout: int = 25, label: str = "Dhan API") -> requests.Response:
+    """POST to Dhan with broker-aware throttling and bounded 429 recovery."""
+    if kind not in {"data", "quote"}:
+        raise ValueError("kind must be data or quote")
+
+    rate_lock = data_rate_lock if kind == "data" else quote_rate_lock
+    interval = DATA_REQUEST_INTERVAL if kind == "data" else QUOTE_REQUEST_INTERVAL
+
+    for attempt in range(MAX_429_RETRIES + 1):
+        _throttle(rate_lock, interval, kind)
+        response = requests.post(
+            url,
+            headers=dhan_headers(token, client_id),
+            json=payload,
+            timeout=timeout,
+        )
+        if response.status_code != 429:
+            response.raise_for_status()
+            return response
+
+        if attempt >= MAX_429_RETRIES:
+            response.raise_for_status()
+
+        retry_after = response.headers.get("Retry-After")
+        try:
+            server_wait = float(retry_after) if retry_after else 0.0
+        except ValueError:
+            server_wait = 0.0
+        backoff = max(server_wait, min(8.0, 0.75 * (2 ** attempt)))
+        log.warning(
+            "Dhan 429 on %s; retry %d/%d after %.2fs",
+            label, attempt + 1, MAX_429_RETRIES, backoff,
+        )
+        time.sleep(backoff)
+
+    raise RuntimeError(f"Unreachable Dhan request state for {label}")
 
 
 def generate_access_token() -> tuple[str, str | None]:
@@ -162,8 +228,14 @@ def fetch_intraday_1m(token: str, security_id: str, from_dt: datetime, to_dt: da
         "fromDate": from_dt.strftime("%Y-%m-%d %H:%M:%S"),
         "toDate": to_dt.strftime("%Y-%m-%d %H:%M:%S"),
     }
-    r = requests.post(f"{DHAN_BASE}/charts/intraday", headers=dhan_headers(token), json=payload, timeout=25)
-    r.raise_for_status()
+    r = dhan_post(
+        f"{DHAN_BASE}/charts/intraday",
+        token=token,
+        payload=payload,
+        kind="data",
+        timeout=25,
+        label=f"intraday:{security_id}",
+    )
     return parse_series_response(r.json())
 
 
@@ -179,8 +251,14 @@ def fetch_previous_day(token: str, security_id: str, today: datetime) -> dict:
         "fromDate": start,
         "toDate": end,
     }
-    r = requests.post(f"{DHAN_BASE}/charts/historical", headers=dhan_headers(token), json=payload, timeout=25)
-    r.raise_for_status()
+    r = dhan_post(
+        f"{DHAN_BASE}/charts/historical",
+        token=token,
+        payload=payload,
+        kind="data",
+        timeout=25,
+        label=f"historical:{security_id}",
+    )
     rows = parse_series_response(r.json())
     if not rows:
         return {"high": None, "low": None, "close": None}
@@ -190,8 +268,15 @@ def fetch_previous_day(token: str, security_id: str, today: datetime) -> dict:
 
 def fetch_market_quote(token: str, client_id: str, security_map: dict[str, str]) -> dict[str, dict]:
     payload = {"NSE_EQ": [int(v) for v in security_map.values()]}
-    r = requests.post(f"{DHAN_BASE}/marketfeed/quote", headers=dhan_headers(token, client_id), json=payload, timeout=20)
-    r.raise_for_status()
+    r = dhan_post(
+        f"{DHAN_BASE}/marketfeed/quote",
+        token=token,
+        client_id=client_id,
+        payload=payload,
+        kind="quote",
+        timeout=20,
+        label="marketfeed:quote",
+    )
     raw = r.json().get("data", {}).get("NSE_EQ", {})
     reverse = {str(v): k for k, v in security_map.items()}
     result = {}
@@ -331,16 +416,49 @@ def rebuild_stock(symbol: str, one_min: list[dict], quote: dict | None, prev: di
         }
 
 
+def rebuild_partial_stock(symbol: str, quote: dict | None, error: str):
+    """Keep a stock streamable when historical backfill temporarily fails."""
+    q = quote or {}
+    with lock:
+        state["stocks"][symbol] = {
+            "symbol": symbol,
+            "security_id": state["security_map"][symbol],
+            "current_price": q.get("current"),
+            "ohlc": {"open": q.get("open"), "high": q.get("high"), "low": q.get("low"), "close": q.get("close")},
+            "session_high": q.get("high"),
+            "session_low": q.get("low"),
+            "previous_day": {"high": None, "low": None, "close": None},
+            "volume": q.get("volume"),
+            "candles": {"1m": [], "5m": [], "15m": [], "1h": []},
+            "vwap": None,
+            "ema9": None,
+            "ema20": None,
+            "opening_range": {"period": "09:15-09:30", "status": "NOT_FORMED", "high": None, "low": None},
+            "structure": {"trend": "INSUFFICIENT_DATA", "swing_high": None, "swing_low": None},
+            "timestamp": now_ist().isoformat(),
+            "trading_date": now_ist().date().isoformat(),
+            "market_session_status": session_status(now_ist()),
+            "data_source_status": "LIVE_PARTIAL" if q else "ERROR",
+            "last_tick": None,
+            "_one_min": [],
+            "_volume_anchor": None,
+            "error": error,
+        }
+
+
 def update_tick(symbol: str, price: float, volume: int, ltt_epoch: int, day_open: float, day_high: float, day_low: float):
     dt = datetime.fromtimestamp(ltt_epoch, IST)
     with lock:
         s = state["stocks"].get(symbol)
         if not s:
             return
+        if "ohlc" not in s:
+            s["ohlc"] = {"open": day_open, "high": day_high, "low": day_low, "close": price}
         s["current_price"] = price
         s["ohlc"]["open"] = day_open
         s["ohlc"]["high"] = day_high
         s["ohlc"]["low"] = day_low
+        s["ohlc"]["close"] = price
         s["session_high"] = day_high
         s["session_low"] = day_low
         s["volume"] = volume
@@ -350,13 +468,13 @@ def update_tick(symbol: str, price: float, volume: int, ltt_epoch: int, day_open
         s["last_tick"] = dt.isoformat()
         minute_dt = dt.replace(second=0, microsecond=0)
         key = int(minute_dt.timestamp())
-        candles = s["_one_min"]
+        candles = s.setdefault("_one_min", [])
         if candles and candles[-1]["epoch"] == key:
             c = candles[-1]
             c["high"] = max(c["high"], price)
             c["low"] = min(c["low"], price)
             c["close"] = price
-            if s["_volume_anchor"] is None:
+            if s.get("_volume_anchor") is None:
                 s["_volume_anchor"] = volume
             c["volume"] = max(0, volume - s["_volume_anchor"])
         else:
@@ -385,33 +503,32 @@ def initialize_session(token: str):
         state["trading_date"] = today.date().isoformat()
         state["market_session_status"] = session_status(today)
         state["source_status"] = "BACKFILLING"
+
     security_map = load_security_map()
     with lock:
         state["security_map"] = security_map
+
     client_id = os.environ["DHAN_CLIENT_ID"]
     quote_map = fetch_market_quote(token, client_id, security_map) if in_session(today) else {}
+    failed: list[str] = []
+
     for symbol in STOCKS:
         try:
             from_dt = today.replace(hour=9, minute=15, second=0, microsecond=0)
             one_min = fetch_intraday_1m(token, security_map[symbol], from_dt, today) if in_session(today) else []
             prev = fetch_previous_day(token, security_map[symbol], today)
             rebuild_stock(symbol, one_min, quote_map.get(symbol), prev)
-            time.sleep(0.22)
         except Exception as exc:
+            failed.append(symbol)
             log.exception("Initialization failed for %s: %s", symbol, exc)
-            with lock:
-                state["stocks"][symbol] = {
-                    "symbol": symbol,
-                    "security_id": security_map[symbol],
-                    "data_source_status": "ERROR",
-                    "error": str(exc),
-                    "timestamp": now_ist().isoformat(),
-                    "trading_date": today.date().isoformat(),
-                    "market_session_status": session_status(today),
-                }
+            rebuild_partial_stock(symbol, quote_map.get(symbol), str(exc))
+
     with lock:
-        state["source_status"] = "READY"
+        state["source_status"] = "DEGRADED" if failed else "READY"
         state["last_update"] = now_ist().isoformat()
+
+    if failed:
+        log.error("Backfill incomplete for %d/%d stocks: %s", len(failed), len(STOCKS), ", ".join(failed))
 
 
 def parse_quote_packet(data: bytes):
