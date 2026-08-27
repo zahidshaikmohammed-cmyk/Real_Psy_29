@@ -18,7 +18,7 @@ UNSUBSCRIBE_QUOTE = 18
 DISCONNECT = 50
 
 HEADER_SIZE = 8
-QUOTE_PACKET_SIZE = 52
+QUOTE_PACKET_SIZE = 50
 
 
 class DhanWebSocketError(RuntimeError):
@@ -69,6 +69,7 @@ def subscription_messages(registry: InstrumentRegistry) -> list[dict]:
 
 
 def parse_quote_packet(payload: bytes, registry: InstrumentRegistry) -> QuoteTick | None:
+    """Decode Dhan v2 Quote Packet using the documented byte layout."""
     if len(payload) < QUOTE_PACKET_SIZE or payload[0] != 4:
         return None
 
@@ -77,20 +78,48 @@ def parse_quote_packet(payload: bytes, registry: InstrumentRegistry) -> QuoteTic
     if instrument is None:
         return None
 
+    # Dhan Quote payload starts at byte 8:
+    # LTP f32, LTQ i16, LTT i32, ATP f32, volume i32,
+    # sell i32, buy i32, open/close/high/low f32 each.
+    ltp = struct.unpack_from("<f", payload, 8)[0]
+    last_trade_quantity = struct.unpack_from("<h", payload, 12)[0]
+    last_trade_epoch = struct.unpack_from("<i", payload, 14)[0]
+    average_trade_price = struct.unpack_from("<f", payload, 18)[0]
+    volume = struct.unpack_from("<i", payload, 22)[0]
+    total_sell_quantity = struct.unpack_from("<i", payload, 26)[0]
+    total_buy_quantity = struct.unpack_from("<i", payload, 30)[0]
+    day_open = struct.unpack_from("<f", payload, 34)[0]
+    day_close = struct.unpack_from("<f", payload, 38)[0]
+    day_high = struct.unpack_from("<f", payload, 42)[0]
+    day_low = struct.unpack_from("<f", payload, 46)[0]
+
+    # Never allow an invalid binary decode into live state.
+    prices = (ltp, average_trade_price, day_open, day_close, day_high, day_low)
+    if not all(value == value and abs(value) != float("inf") for value in prices):
+        return None
+    if ltp <= 0 or average_trade_price < 0:
+        return None
+    if volume < 0 or last_trade_quantity < 0 or total_sell_quantity < 0 or total_buy_quantity < 0:
+        return None
+    if day_open <= 0 or day_high <= 0 or day_low <= 0:
+        return None
+    if day_high < day_low or day_high < day_open or day_low > day_open:
+        return None
+
     return QuoteTick(
         symbol=instrument.symbol,
         security_id=security_id,
-        ltp=struct.unpack_from("<f", payload, 8)[0],
-        last_trade_quantity=struct.unpack_from("<i", payload, 12)[0],
-        last_trade_epoch=struct.unpack_from("<i", payload, 16)[0],
-        average_trade_price=struct.unpack_from("<f", payload, 20)[0],
-        volume=struct.unpack_from("<i", payload, 24)[0],
-        total_sell_quantity=struct.unpack_from("<i", payload, 28)[0],
-        total_buy_quantity=struct.unpack_from("<i", payload, 32)[0],
-        day_open=struct.unpack_from("<f", payload, 36)[0],
-        day_close=struct.unpack_from("<f", payload, 40)[0],
-        day_high=struct.unpack_from("<f", payload, 44)[0],
-        day_low=struct.unpack_from("<f", payload, 48)[0],
+        ltp=ltp,
+        last_trade_quantity=last_trade_quantity,
+        last_trade_epoch=last_trade_epoch,
+        average_trade_price=average_trade_price,
+        volume=volume,
+        total_sell_quantity=total_sell_quantity,
+        total_buy_quantity=total_buy_quantity,
+        day_open=day_open,
+        day_close=day_close,
+        day_high=day_high,
+        day_low=day_low,
     )
 
 
