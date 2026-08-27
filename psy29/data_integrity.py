@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 import math
+import struct
+import sys
 from datetime import datetime, time, timedelta
 
 IST_OPEN = time(9, 15)
@@ -68,7 +70,6 @@ def validate_ohlcv_row(row: dict, trading_date: str, *, session_only: bool = Tru
 
 
 def validate_intraday_rows(rows: object, trading_date: str) -> list[dict]:
-    """Validate every row; duplicates and ordering errors are hard failures."""
     if not isinstance(rows, list) or not rows:
         raise DataIntegrityError("empty intraday history")
     valid: list[dict] = []
@@ -184,10 +185,7 @@ def validate_tick(ltp: object, volume: object, ltt_epoch: object, day_open: obje
     return price, vol, ltt, opn, high, low
 
 
-# Safe temporary diagnostics at the REST quote boundary. Only market-data fields
-# are logged; credentials, tokens, TOTP values and authorization headers are never logged.
 def _install_quote_boundary_diagnostics() -> None:
-    import sys
     main = sys.modules.get("main")
     if main is None or not hasattr(main, "dhan_post") or getattr(main, "_psy29_quote_diag_installed", False):
         return
@@ -225,4 +223,36 @@ def _install_quote_boundary_diagnostics() -> None:
     main._psy29_quote_diag_installed = True
 
 
+def _install_canonical_ws_parser() -> None:
+    main = sys.modules.get("main")
+    if main is None:
+        return
+
+    def parse_quote_packet(data: bytes):
+        if len(data) < 50 or data[0] != 4:
+            return None
+        security_id = struct.unpack_from("<i", data, 4)[0]
+        ltp = struct.unpack_from("<f", data, 8)[0]
+        ltq = struct.unpack_from("<h", data, 12)[0]
+        ltt = struct.unpack_from("<i", data, 14)[0]
+        atp = struct.unpack_from("<f", data, 18)[0]
+        volume = struct.unpack_from("<i", data, 22)[0]
+        total_sell = struct.unpack_from("<i", data, 26)[0]
+        total_buy = struct.unpack_from("<i", data, 30)[0]
+        day_open = struct.unpack_from("<f", data, 34)[0]
+        day_close = struct.unpack_from("<f", data, 38)[0]
+        day_high = struct.unpack_from("<f", data, 42)[0]
+        day_low = struct.unpack_from("<f", data, 46)[0]
+        values = (ltp, atp, day_open, day_close, day_high, day_low)
+        if not all(math.isfinite(v) for v in values) or any(v <= 0 for v in (ltp, day_open, day_high, day_low)):
+            return None
+        if atp < 0 or volume <= 0 or ltq < 0 or total_sell < 0 or total_buy < 0:
+            return None
+        return security_id, ltp, volume, ltt, day_open, day_high, day_low
+
+    main.parse_quote_packet = parse_quote_packet
+    main._psy29_ws_parser_canonical = True
+
+
 _install_quote_boundary_diagnostics()
+_install_canonical_ws_parser()
