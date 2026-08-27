@@ -14,12 +14,14 @@ def registry():
 
 
 def quote_packet():
-    header = struct.pack("<BhBi", 4, 52, 0, 123)
+    # Dhan v2 Quote packet: 8-byte header + documented 42-byte payload.
+    header = struct.pack("<BhBi", 4, 50, 0, 123)
     body = struct.pack(
-        "<fiifiii ffff".replace(" ", ""),
+        "<fhiffiiiffff",
         2500.5, 10, 1720000000, 2501.0, 100000, 2000, 3000,
         2490.0, 2505.0, 2510.0, 2480.0,
     )
+    assert len(header + body) == 50
     return header + body
 
 
@@ -44,10 +46,18 @@ def test_quote_packet_decodes_documented_fields():
     assert tick.last_trade_epoch == 1720000000
     assert tick.average_trade_price == 2501.0
     assert tick.volume == 100000
+    assert tick.total_sell_quantity == 2000
+    assert tick.total_buy_quantity == 3000
     assert tick.day_open == 2490.0
     assert tick.day_close == 2505.0
     assert tick.day_high == 2510.0
     assert tick.day_low == 2480.0
+
+
+def test_quote_packet_rejects_invalid_price_decode():
+    payload = bytearray(quote_packet())
+    payload[8:12] = struct.pack("<f", -1.0)
+    assert parse_quote_packet(bytes(payload), registry()) is None
 
 
 def test_unknown_security_is_ignored():
