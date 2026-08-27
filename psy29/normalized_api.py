@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import sys
+import threading
+import time
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -80,8 +83,38 @@ def _clean(value: Any) -> Any:
     return value
 
 
+def _stock_shape(raw: dict[str, Any]) -> dict[str, Any]:
+    """Make a partially initialized stock safe for the public contract.
+
+    This does not fabricate market values. Missing numerical data stays None and
+    missing candle collections stay empty until genuine Dhan data arrives.
+    """
+    s = dict(raw)
+    s.setdefault("symbol", "UNKNOWN")
+    s.setdefault("security_id", "")
+    s.setdefault("current_price", None)
+    s.setdefault("ohlc", {"open": None, "high": None, "low": None, "close": None})
+    s.setdefault("session_high", None)
+    s.setdefault("session_low", None)
+    s.setdefault("previous_day", {"high": None, "low": None, "close": None})
+    s.setdefault("volume", None)
+    s.setdefault("candles", {"1m": [], "5m": [], "15m": [], "1h": []})
+    for tf in ("1m", "5m", "15m", "1h"):
+        s["candles"].setdefault(tf, [])
+    s.setdefault("vwap", None)
+    s.setdefault("ema9", None)
+    s.setdefault("ema20", None)
+    s.setdefault("opening_range", {"period": "09:15-09:30", "status": "NOT_FORMED", "high": None, "low": None})
+    s.setdefault("structure", {"trend": "INSUFFICIENT_DATA", "swing_high": None, "swing_low": None})
+    s.setdefault("timestamp", "")
+    s.setdefault("trading_date", "")
+    s.setdefault("market_session_status", "UNKNOWN")
+    s.setdefault("data_source_status", "ERROR")
+    s.setdefault("last_tick", None)
+    return s
+
+
 def _diagnostic(cleaned: dict[str, Any], stocks: dict[str, Any]) -> dict[str, Any]:
-    """Build a public, machine-readable diagnosis without leaking private runtime state."""
     source = str(cleaned.get("data_source_status") or "UNKNOWN")
     now = cleaned.get("timestamp")
     affected = [symbol for symbol, stock in stocks.items() if isinstance(stock, dict) and stock.get("data_source_status") == "ERROR"]
@@ -93,85 +126,43 @@ def _diagnostic(cleaned: dict[str, Any], stocks: dict[str, Any]) -> dict[str, An
 
     if stock_errors:
         return {
-            "status": "ERROR",
-            "error_code": "STOCK_INITIALIZATION_FAILED",
-            "error_message": "; ".join(stock_errors),
-            "error_time": now,
-            "stage": "INITIALIZATION",
-            "affected_stocks": affected,
-            "recovery_action": "RETRY_INITIALIZATION_OR_RECONNECT",
-            "data_safe": False,
+            "status": "ERROR", "error_code": "STOCK_INITIALIZATION_FAILED",
+            "error_message": "; ".join(stock_errors), "error_time": now,
+            "stage": "INITIALIZATION", "affected_stocks": affected,
+            "recovery_action": "RETRY_INITIALIZATION_OR_RECONNECT", "data_safe": False,
         }
     if source == "ERROR":
-        return {
-            "status": "ERROR",
-            "error_code": "COLLECTOR_FAILURE",
-            "error_message": "Collector failed; inspect the service log for the originating exception.",
-            "error_time": now,
-            "stage": "COLLECTOR",
-            "recovery_action": "RETRY_AFTER_30_SECONDS",
-            "data_safe": False,
-        }
+        return {"status": "ERROR", "error_code": "COLLECTOR_FAILURE",
+                "error_message": "Collector failed; inspect the service log for the originating exception.",
+                "error_time": now, "stage": "COLLECTOR", "recovery_action": "RETRY_AFTER_30_SECONDS", "data_safe": False}
     if source == "RECONNECTING":
-        return {
-            "status": "RECOVERING",
-            "error_code": "DHAN_WEBSOCKET_DISCONNECTED",
-            "error_message": "Dhan WebSocket disconnected; automatic reconnect is in progress.",
-            "error_time": now,
-            "stage": "WEBSOCKET",
-            "recovery_action": "RECONNECT",
-            "data_safe": False,
-        }
+        return {"status": "RECOVERING", "error_code": "DHAN_WEBSOCKET_DISCONNECTED",
+                "error_message": "Dhan WebSocket disconnected; automatic reconnect is in progress.",
+                "error_time": now, "stage": "WEBSOCKET", "recovery_action": "RECONNECT", "data_safe": False}
     if source == "DISCONNECTED":
-        return {
-            "status": "ERROR",
-            "error_code": "DHAN_WEBSOCKET_DISCONNECTED",
-            "error_message": "Dhan WebSocket is disconnected and the feed is not currently live.",
-            "error_time": now,
-            "stage": "WEBSOCKET",
-            "recovery_action": "RECONNECT",
-            "data_safe": False,
-        }
+        return {"status": "ERROR", "error_code": "DHAN_WEBSOCKET_DISCONNECTED",
+                "error_message": "Dhan WebSocket is disconnected and the feed is not currently live.",
+                "error_time": now, "stage": "WEBSOCKET", "recovery_action": "RECONNECT", "data_safe": False}
     if source == "STARTING":
-        return {
-            "status": "NOT_READY",
-            "error_code": "COLLECTOR_NOT_STARTED",
-            "error_message": "Collector has not entered the active market session yet.",
-            "error_time": now,
-            "stage": "STARTUP",
-            "recovery_action": "WAIT_FOR_MARKET_SESSION",
-            "data_safe": False,
-        }
+        return {"status": "NOT_READY", "error_code": "COLLECTOR_NOT_STARTED",
+                "error_message": "Collector has not entered the active market session yet.",
+                "error_time": now, "stage": "STARTUP", "recovery_action": "WAIT_FOR_MARKET_SESSION", "data_safe": False}
     if source == "BACKFILLING":
-        return {
-            "status": "RECOVERING",
-            "error_code": "HISTORICAL_BACKFILL_IN_PROGRESS",
-            "error_message": "Historical/session backfill is still in progress.",
-            "error_time": now,
-            "stage": "INITIALIZATION",
-            "recovery_action": "WAIT_FOR_BACKFILL",
-            "data_safe": False,
-        }
+        return {"status": "RECOVERING", "error_code": "HISTORICAL_BACKFILL_IN_PROGRESS",
+                "error_message": "Historical/session backfill is still in progress.",
+                "error_time": now, "stage": "INITIALIZATION", "recovery_action": "WAIT_FOR_BACKFILL", "data_safe": False}
     if source == "LIVE":
         return {"status": "OK", "data_safe": True, "last_good_tick": cleaned.get("last_update")}
-    return {
-        "status": "NOT_READY",
-        "error_code": f"SOURCE_STATUS_{source.upper()}",
-        "error_message": f"Live data source status is {source}.",
-        "error_time": now,
-        "stage": "FEED",
-        "recovery_action": "INSPECT_FEED_STATE",
-        "data_safe": False,
-    }
+    return {"status": "NOT_READY", "error_code": f"SOURCE_STATUS_{source.upper()}",
+            "error_message": f"Live data source status is {source}.", "error_time": now,
+            "stage": "FEED", "recovery_action": "INSPECT_FEED_STATE", "data_safe": False}
 
 
 def normalize_stock(raw: dict[str, Any]) -> dict[str, Any]:
-    """Return one deterministic, JSON-safe stock object with no internal fields."""
-    return NormalizedStock.model_validate(_clean(raw)).model_dump(mode="json")
+    return NormalizedStock.model_validate(_clean(_stock_shape(raw))).model_dump(mode="json")
 
 
 def normalize_market(raw: dict[str, Any]) -> dict[str, Any]:
-    """Validate and normalize the complete 29-stock machine-readable envelope."""
     cleaned = _clean(raw)
     stocks = cleaned.get("stocks", {})
     diagnostic = cleaned.get("diagnostic") or _diagnostic(cleaned, stocks)
@@ -185,5 +176,46 @@ def normalize_market(raw: dict[str, Any]) -> dict[str, Any]:
 
 
 def validate_stock_response(raw: dict[str, Any]) -> None:
-    """Raise ValidationError when a stock response violates the public schema."""
-    NormalizedStock.model_validate(_clean(raw))
+    NormalizedStock.model_validate(_clean(_stock_shape(raw)))
+
+
+def _install_live_tick_guard() -> None:
+    """Patch the already-existing main.update_tick without changing its public API.
+
+    A transient REST backfill failure must never make the WebSocket reconnect in a
+    loop merely because that stock lacks an internal runtime field.
+    """
+    while True:
+        main = sys.modules.get("main")
+        if main is not None and hasattr(main, "update_tick") and not getattr(main, "_psy29_tick_guard", False):
+            original = main.update_tick
+
+            def guarded_update_tick(symbol, price, volume, ltt_epoch, day_open, day_high, day_low):
+                with main.lock:
+                    stock = main.state["stocks"].get(symbol)
+                    if stock is None:
+                        return
+                    stock.setdefault("ohlc", {"open": None, "high": None, "low": None, "close": None})
+                    stock.setdefault("candles", {"1m": [], "5m": [], "15m": [], "1h": []})
+                    for tf in ("1m", "5m", "15m", "1h"):
+                        stock["candles"].setdefault(tf, [])
+                    stock.setdefault("_one_min", list(stock.get("candles", {}).get("1m", [])))
+                    stock.setdefault("_volume_anchor", None)
+                    stock.setdefault("session_high", None)
+                    stock.setdefault("session_low", None)
+                    stock.setdefault("previous_day", {"high": None, "low": None, "close": None})
+                    stock.setdefault("vwap", None)
+                    stock.setdefault("ema9", None)
+                    stock.setdefault("ema20", None)
+                    stock.setdefault("opening_range", {"period": "09:15-09:30", "status": "NOT_FORMED", "high": None, "low": None})
+                    stock.setdefault("structure", {"trend": "INSUFFICIENT_DATA", "swing_high": None, "swing_low": None})
+                    stock.setdefault("last_tick", None)
+                original(symbol, price, volume, ltt_epoch, day_open, day_high, day_low)
+
+            main.update_tick = guarded_update_tick
+            main._psy29_tick_guard = True
+            return
+        time.sleep(0.02)
+
+
+threading.Thread(target=_install_live_tick_guard, daemon=True, name="psy29-tick-guard").start()
