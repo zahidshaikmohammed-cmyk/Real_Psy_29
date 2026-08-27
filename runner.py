@@ -1,5 +1,6 @@
 import json
 import math
+import struct
 import threading
 import time
 from datetime import datetime
@@ -17,6 +18,48 @@ main.app.router.on_startup.clear()
 store = IntradayStore()
 CHECKPOINT_SECONDS = 60.0
 AUTH_COOLDOWN_SECONDS = 125.0
+
+
+def _parse_quote_packet(data: bytes):
+    """Decode the Dhan v2 Quote packet exactly once, at the production entrypoint.
+
+    Dhan's documented Quote layout is an 8-byte header followed by:
+    LTP float32, LTQ int16, LTT int32, ATP float32, volume int32,
+    sell int32, buy int32, open/close/high/low float32.
+    """
+    if len(data) < 50 or data[0] != 4:
+        return None
+    security_id = struct.unpack_from("<i", data, 4)[0]
+    ltp = struct.unpack_from("<f", data, 8)[0]
+    ltq = struct.unpack_from("<h", data, 12)[0]
+    ltt = struct.unpack_from("<i", data, 14)[0]
+    # Decode the remaining documented fields so malformed packets can be rejected
+    # before any state mutation. Runner only needs LTP/volume/LTT/day OHLC below.
+    atp = struct.unpack_from("<f", data, 18)[0]
+    volume = struct.unpack_from("<i", data, 22)[0]
+    total_sell = struct.unpack_from("<i", data, 26)[0]
+    total_buy = struct.unpack_from("<i", data, 30)[0]
+    day_open = struct.unpack_from("<f", data, 34)[0]
+    day_close = struct.unpack_from("<f", data, 38)[0]
+    day_high = struct.unpack_from("<f", data, 42)[0]
+    day_low = struct.unpack_from("<f", data, 46)[0]
+
+    prices = (ltp, atp, day_open, day_close, day_high, day_low)
+    if not all(math.isfinite(v) for v in prices):
+        return None
+    if ltp <= 0 or atp < 0 or day_open <= 0 or day_high <= 0 or day_low <= 0:
+        return None
+    if volume < 0 or ltq < 0 or total_sell < 0 or total_buy < 0:
+        return None
+    if day_high < day_low or day_high < day_open or day_low > day_open:
+        return None
+    return security_id, ltp, volume, ltt, day_open, day_high, day_low
+
+
+# main.py contains a legacy duplicate WebSocket decoder. The production service
+# runs through runner.py, so install the corrected decoder before startup. This
+# prevents the old int32 LTQ offset bug from ever reaching live state.
+main.parse_quote_packet = _parse_quote_packet
 
 
 def _snapshot() -> tuple[str | None, dict]:
@@ -135,23 +178,18 @@ def _restore_checkpoint_if_needed(trading_date: str) -> None:
             current = main.state["stocks"].get(symbol)
             if not current:
                 continue
-
             saved_candles = payload.get("candles")
             if _valid_saved_candles(saved_candles, trading_date):
                 current["candles"] = saved_candles
                 current["_one_min"] = list(saved_candles.get("1m", []))
             elif saved_candles:
                 rejected += 1
-
             for key in ("previous_day", "vwap", "ema9", "ema20", "opening_range", "structure", "session_high", "session_low"):
                 if key in payload:
                     current[key] = payload[key]
             current["_volume_anchor"] = None
-
-            # Never restore a corrupted price/tick over the fresh Dhan seed.
             if current.get("current_price") is None and _valid_saved_price(payload.get("current_price")):
                 current["current_price"] = payload["current_price"]
-
     if rejected:
         main.log.warning("Rejected %s/%s persisted candle sets as invalid; fresh Dhan history required", rejected, len(saved))
     main.log.info("Intraday Postgres recovery inspected %s/%s saved stocks", len(saved), len(main.STOCKS))
