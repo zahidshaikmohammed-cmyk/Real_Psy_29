@@ -1,6 +1,8 @@
 import json
+import math
 import threading
 import time
+from datetime import datetime
 
 import main
 from fastapi.responses import Response
@@ -83,29 +85,76 @@ def _seed_live_state(token: str, security_map: dict[str, str]) -> None:
             }
 
 
+def _valid_saved_candles(candles: object, trading_date: str) -> bool:
+    """Reject persisted history that could have been written by an older bad decoder."""
+    if not isinstance(candles, dict):
+        return False
+    for tf in ("1m", "5m", "15m", "1h"):
+        rows = candles.get(tf, [])
+        if not isinstance(rows, list):
+            return False
+        previous = None
+        for row in rows:
+            if not isinstance(row, dict):
+                return False
+            try:
+                timestamp = datetime.fromisoformat(str(row["timestamp"]))
+                if timestamp.tzinfo is None or timestamp.date().isoformat() != trading_date:
+                    return False
+                values = [float(row[key]) for key in ("open", "high", "low", "close")]
+                volume = int(row.get("volume", 0))
+            except (KeyError, TypeError, ValueError, OverflowError):
+                return False
+            if not all(math.isfinite(v) and v > 0 for v in values) or volume < 0:
+                return False
+            opn, high, low, close = values
+            if high < max(opn, close) or low > min(opn, close) or high < low:
+                return False
+            if previous is not None and timestamp <= previous:
+                return False
+            previous = timestamp
+    return True
+
+
+def _valid_saved_price(value: object) -> bool:
+    try:
+        return math.isfinite(float(value)) and float(value) > 0
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
 def _restore_checkpoint_if_needed(trading_date: str) -> None:
     saved = store.load_session(trading_date)
     if not saved:
         return
+    rejected = 0
     with main.lock:
         for symbol, payload in saved.items():
             if symbol not in main.STOCKS or not isinstance(payload, dict):
                 continue
             current = main.state["stocks"].get(symbol)
             if not current:
-                main.state["stocks"][symbol] = payload
                 continue
+
             saved_candles = payload.get("candles")
-            if isinstance(saved_candles, dict):
+            if _valid_saved_candles(saved_candles, trading_date):
                 current["candles"] = saved_candles
                 current["_one_min"] = list(saved_candles.get("1m", []))
+            elif saved_candles:
+                rejected += 1
+
             for key in ("previous_day", "vwap", "ema9", "ema20", "opening_range", "structure", "session_high", "session_low"):
                 if key in payload:
                     current[key] = payload[key]
             current["_volume_anchor"] = None
-            if current.get("current_price") is None and payload.get("current_price") is not None:
+
+            # Never restore a corrupted price/tick over the fresh Dhan seed.
+            if current.get("current_price") is None and _valid_saved_price(payload.get("current_price")):
                 current["current_price"] = payload["current_price"]
-    main.log.info("Intraday Postgres recovery loaded %s/%s saved stocks", len(saved), len(main.STOCKS))
+
+    if rejected:
+        main.log.warning("Rejected %s/%s persisted candle sets as invalid; fresh Dhan history required", rejected, len(saved))
+    main.log.info("Intraday Postgres recovery inspected %s/%s saved stocks", len(saved), len(main.STOCKS))
 
 
 def _backfill_worker(token: str, security_map: dict[str, str]) -> None:
@@ -191,8 +240,6 @@ def _machine_payload() -> dict:
     return main.normalize_market(raw)
 
 
-# Plain-text JSON endpoint. Some fetch/crawler layers handle text resources more
-# reliably than application/json responses from dynamic Render services.
 @main.app.get("/data.txt")
 def data_txt():
     body = json.dumps(_machine_payload(), separators=(",", ":"), ensure_ascii=False)
