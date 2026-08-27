@@ -1,10 +1,57 @@
 """PSY29 runtime hardening loaded automatically by Python at process startup."""
+from __future__ import annotations
+
+import asyncio
+import random
 import sys
 import threading
 import time
 
 _PATCHED = False
 _ORIGINAL_START = threading.Thread.start
+
+# Dhan can return HTTP 429 when WebSocket handshakes are retried too quickly.
+# The application-level reconnect loop is intentionally retained; this guard
+# prevents a broker rate-limit from becoming a 3-second reconnect storm.
+try:
+    import websockets
+    _ORIGINAL_WS_CONNECT = websockets.connect
+
+    class _DhanRateLimitedConnect:
+        def __init__(self, *args, **kwargs):
+            self._args = args
+            self._kwargs = kwargs
+            self._connection = None
+
+        async def __aenter__(self):
+            delay = 15.0
+            for attempt in range(8):
+                self._connection = _ORIGINAL_WS_CONNECT(*self._args, **self._kwargs)
+                try:
+                    return await self._connection.__aenter__()
+                except Exception as exc:
+                    text = str(exc).lower()
+                    is_429 = "429" in text or "too many requests" in text
+                    try:
+                        await self._connection.__aexit__(type(exc), exc, exc.__traceback__)
+                    except Exception:
+                        pass
+                    if not is_429 or attempt == 7:
+                        raise
+                    await asyncio.sleep(min(60.0, delay) + random.uniform(0.0, 2.0))
+                    delay = min(60.0, delay * 2.0)
+
+        async def __aexit__(self, exc_type, exc, tb):
+            if self._connection is None:
+                return False
+            return await self._connection.__aexit__(exc_type, exc, tb)
+
+    def _guarded_ws_connect(*args, **kwargs):
+        return _DhanRateLimitedConnect(*args, **kwargs)
+
+    websockets.connect = _guarded_ws_connect
+except Exception:
+    pass
 
 
 def _supervise_psy29_collector():
