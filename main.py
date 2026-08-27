@@ -627,6 +627,14 @@ def health():
         return {"ok": True, "status": state["source_status"], "timestamp": now_ist().isoformat()}
 
 
+@app.get("/data.json")
+def data_json():
+    response = JSONResponse(content=normalize_market(state))
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
+
 @app.get("/data")
 def data():
     with lock:
