@@ -30,10 +30,10 @@ def test_non_chronological_candles_are_hard_failure():
 
 def test_future_candle_is_hard_failure():
     row = candle(15)
-    row["timestamp"] = "2026-08-27T12:00:00+05:30"
+    row["timestamp"] = "2026-08-27T14:00:00+05:30"
     row["epoch"] = int(datetime.fromisoformat(row["timestamp"]).timestamp())
     with pytest.raises(DataIntegrityError, match="future candle"):
-        validate_intraday_rows([row] * 15, TRADING_DATE)
+        validate_intraday_rows([row], TRADING_DATE)
 
 
 def test_zero_quote_volume_is_hard_failure():
