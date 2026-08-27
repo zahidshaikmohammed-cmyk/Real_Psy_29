@@ -8,7 +8,7 @@ from psy29.data_integrity import DataIntegrityError, validate_intraday_rows, val
 TRADING_DATE = "2026-08-27"
 
 
-def candle(ts="2026-08-27T09:15:00+05:30", epoch=1787795100, price=1900.0):
+def candle(ts="2026-08-27T09:15:00+05:30", epoch=1787802300, price=1900.0):
     return {"timestamp": ts, "epoch": epoch, "open": price, "high": price + 2, "low": price - 2, "close": price + 1, "volume": 100}
 
 
@@ -28,7 +28,7 @@ def test_rejects_absurd_float_candle():
 
 def test_rejects_out_of_order_duplicate_candles():
     first = candle()
-    second = candle(ts="2026-08-27T09:14:00+05:30", epoch=1787795040)
+    second = candle(ts="2026-08-27T09:14:00+05:30", epoch=1787802240)
     with pytest.raises(DataIntegrityError):
         validate_intraday_rows([first, second], TRADING_DATE)
 
