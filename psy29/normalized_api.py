@@ -219,3 +219,9 @@ def _install_live_tick_guard() -> None:
 
 
 threading.Thread(target=_install_live_tick_guard, daemon=True, name="psy29-tick-guard").start()
+
+# Start the existing publisher from the normal application import path. The
+# publisher waits for runner._machine_payload() to exist and for its LIVE/29/SAFE
+# gate before making any GitHub request, so this does not create a second loop.
+from psy29.github_master_publisher_runtime import start as _start_github_master_publisher
+_start_github_master_publisher()
