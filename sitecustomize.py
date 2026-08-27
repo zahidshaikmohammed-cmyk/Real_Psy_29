@@ -129,6 +129,16 @@ def _supervise_psy29_collector():
             backoff = min(backoff * 2, 30)
 
 
+def _start_psy29_github_master_publisher():
+    if not os.getenv("GITHUB_LIVE_DATA_TOKEN"):
+        return
+    try:
+        from psy29.github_master_publisher_runtime import start
+        start()
+    except Exception as exc:
+        print(f"PSY29 GitHub master publisher import failed: {type(exc).__name__}", flush=True)
+
+
 def _patched_start(self, *args, **kwargs):
     target = getattr(self, "_target", None)
     name = getattr(self, "name", "")
@@ -136,6 +146,8 @@ def _patched_start(self, *args, **kwargs):
         self._target = _supervise_psy29_collector
         self._args = ()
         self._kwargs = {}
+    if name == "psy29-supervisor":
+        _start_psy29_github_master_publisher()
     return _ORIGINAL_START(self, *args, **kwargs)
 
 
@@ -144,19 +156,9 @@ if not _PATCHED:
     _PATCHED = True
 
 
-def _start_psy29_github_master_publisher():
-    if not os.getenv("GITHUB_LIVE_DATA_TOKEN"):
-        return
-    try:
-        from psy29.github_master_publisher_runtime import start
-        start()
-    except Exception:
-        return
-
-
 def _github_master_bootstrap():
-    # Render starts runner.py as __main__, so wait for its machine payload rather
-    # than importing runner a second time.
+    # Render starts runner.py as __main__; this is only a fallback for startup
+    # paths where the supervisor thread is not created immediately.
     for _ in range(120):
         process = sys.modules.get("__main__")
         if process is not None and hasattr(process, "_machine_payload"):
