@@ -1,4 +1,5 @@
 from datetime import datetime
+import math
 import struct
 
 import pytest
@@ -16,15 +17,63 @@ def candle(minute: int, price: float = 1900.0, volume: int = 100):
             "low": price - 2, "close": price + 1, "volume": volume}
 
 
-def test_duplicate_candles_are_hard_failure():
-    rows = [candle(15) for _ in range(15)]
-    with pytest.raises(DataIntegrityError, match="duplicate candle"):
+def valid_rows(count=15):
+    return [candle(15 + i) for i in range(count)]
+
+
+def test_one_zero_volume_candle_is_quarantined_and_stock_survives():
+    rows = valid_rows(15)
+    rows.insert(5, candle(20, volume=0))
+    result = validate_intraday_rows(rows, TRADING_DATE)
+    assert len(result) == 15
+    assert all(row["volume"] > 0 for row in result)
+
+
+def test_multiple_zero_volume_candles_survive_when_sufficient_history_remains():
+    rows = valid_rows(17)
+    rows.insert(5, candle(20, volume=0))
+    rows.insert(10, candle(25, volume=-1))
+    result = validate_intraday_rows(rows, TRADING_DATE)
+    assert len(result) == 17
+    assert all(row["volume"] > 0 for row in result)
+
+
+def test_all_zero_volume_candles_fail():
+    rows = [candle(15 + i, volume=0) for i in range(20)]
+    with pytest.raises(DataIntegrityError, match="insufficient valid intraday history: 0 rows"):
         validate_intraday_rows(rows, TRADING_DATE)
 
 
-def test_non_chronological_candles_are_hard_failure():
-    rows = [candle(15), candle(17), candle(16)] + [candle(i) for i in range(18, 30)]
-    with pytest.raises(DataIntegrityError, match="non-chronological candle"):
+def test_insufficient_valid_candles_fail_after_quarantine():
+    rows = valid_rows(14) + [candle(29, volume=0)]
+    with pytest.raises(DataIntegrityError, match="insufficient valid intraday history: 14 rows"):
+        validate_intraday_rows(rows, TRADING_DATE)
+
+
+def test_impossible_ohlc_remains_hard_failure():
+    row = candle(15)
+    row["high"] = row["open"] - 1
+    with pytest.raises(DataIntegrityError, match="invalid OHLC bounds"):
+        validate_intraday_rows(valid_rows(14) + [row], TRADING_DATE)
+
+
+def test_nan_price_remains_hard_failure():
+    row = candle(15)
+    row["high"] = math.nan
+    with pytest.raises(DataIntegrityError, match="non-finite/out-of-range equity price"):
+        validate_intraday_rows(valid_rows(14) + [row], TRADING_DATE)
+
+
+def test_infinity_price_remains_hard_failure():
+    row = candle(15)
+    row["low"] = math.inf
+    with pytest.raises(DataIntegrityError, match="non-finite/out-of-range equity price"):
+        validate_intraday_rows(valid_rows(14) + [row], TRADING_DATE)
+
+
+def test_duplicate_candles_are_hard_failure():
+    rows = valid_rows(14) + [candle(28), candle(28)]
+    with pytest.raises(DataIntegrityError, match="duplicate candle"):
         validate_intraday_rows(rows, TRADING_DATE)
 
 
@@ -34,6 +83,20 @@ def test_future_candle_is_hard_failure():
     row["epoch"] = int(datetime.fromisoformat(row["timestamp"]).timestamp())
     with pytest.raises(DataIntegrityError, match="future candle"):
         validate_intraday_rows([row], TRADING_DATE)
+
+
+def test_wrong_session_timestamp_is_hard_failure():
+    row = candle(15)
+    row["timestamp"] = "2026-08-27T08:59:00+05:30"
+    row["epoch"] = int(datetime.fromisoformat(row["timestamp"]).timestamp())
+    with pytest.raises(DataIntegrityError, match="outside NSE session"):
+        validate_intraday_rows([row], TRADING_DATE)
+
+
+def test_non_chronological_candles_are_hard_failure():
+    rows = [candle(15), candle(17), candle(16)] + [candle(i) for i in range(18, 30)]
+    with pytest.raises(DataIntegrityError, match="non-chronological candle"):
+        validate_intraday_rows(rows, TRADING_DATE)
 
 
 def test_zero_quote_volume_is_hard_failure():
