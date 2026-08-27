@@ -8,7 +8,14 @@ from datetime import datetime
 import main
 from fastapi.responses import Response, JSONResponse
 from psy29.intraday_store import IntradayStore
-from psy29.data_integrity import DataIntegrityError, validate_intraday_rows, validate_quote, validate_tick, validate_ohlcv_row
+from psy29.data_integrity import (
+    DataIntegrityError,
+    validate_intraday_rows,
+    validate_live_quote,
+    validate_live_tick,
+    validate_quote,
+    validate_ohlcv_row,
+)
 
 main.app.router.on_startup.clear()
 store = IntradayStore()
@@ -17,7 +24,7 @@ AUTH_COOLDOWN_SECONDS = 125.0
 
 
 def _parse_quote_packet(data: bytes):
-    if len(data) < 50 or data[0] != 4:
+    if len(data) < 51 or data[0] != 4:
         return None
     security_id = struct.unpack_from("<i", data, 4)[0]
     ltp = struct.unpack_from("<f", data, 8)[0]
@@ -36,9 +43,10 @@ def _parse_quote_packet(data: bytes):
         return None
     if volume < 0 or ltq < 0 or total_sell < 0 or total_buy < 0:
         return None
-    if day_high < day_low or day_high < day_open or day_low > day_open or not day_low <= ltp <= day_high:
-        return None
+    # The broker packet is parsed strictly, but its aggregate day OHLC is not
+    # promoted to canonical session state. Validated 1m candles own that state.
     return security_id, ltp, volume, ltt, day_open, day_high, day_low
+
 
 main.parse_quote_packet = _parse_quote_packet
 
@@ -53,9 +61,12 @@ def _validated_previous_day(token, security_id, today):
     if not isinstance(prev, dict) or any(prev.get(k) is None for k in ("high", "low", "close")):
         raise DataIntegrityError("missing previous-day OHLC")
     values = {k: float(prev[k]) for k in ("high", "low", "close")}
-    if not all(math.isfinite(v) and v > 0 for v in values.values()) or values["high"] < values["low"]:
+    if not all(math.isfinite(v) and v > 0 for v in values.values()):
         raise DataIntegrityError("invalid previous-day OHLC")
+    if values["high"] < values["low"] or values["high"] < values["close"] or values["low"] > values["close"]:
+        raise DataIntegrityError("invalid previous-day OHLC bounds")
     return values
+
 
 main._original_fetch_intraday_1m = main.fetch_intraday_1m
 main._original_fetch_previous_day = main.fetch_previous_day
@@ -65,15 +76,28 @@ main.fetch_previous_day = _validated_previous_day
 
 def _validated_market_quote(token, client_id, security_map):
     raw = main._original_fetch_market_quote(token, client_id, security_map)
-    clean, rejected = {}, []
+    clean = {}
+    rejected = []
     for symbol in main.STOCKS:
         try:
-            clean[symbol] = validate_quote(raw.get(symbol))
-        except DataIntegrityError:
-            rejected.append(symbol)
+            live = validate_live_quote(raw.get(symbol))
+            # Keep only independently validated live quote fields. Broker
+            # aggregate OHLC is intentionally quarantined; session OHLC comes
+            # from validated 1m candles in _validated_rebuild_stock.
+            clean[symbol] = {
+                "current": live["current"],
+                "open": None,
+                "high": None,
+                "low": None,
+                "close": None,
+                "volume": live["volume"],
+            }
+        except DataIntegrityError as exc:
+            rejected.append(f"{symbol}: {exc}")
     if rejected:
-        raise DataIntegrityError("Dhan quote integrity failure: " + ",".join(rejected))
+        raise DataIntegrityError("Dhan live quote integrity failure: " + "; ".join(rejected))
     return clean
+
 
 main._original_fetch_market_quote = main.fetch_market_quote
 main.fetch_market_quote = _validated_market_quote
@@ -115,16 +139,27 @@ def _seed_live_state(token, security_map):
         for symbol in main.STOCKS:
             q = quote_map[symbol]
             main.state["stocks"][symbol] = {
-                "symbol": symbol, "security_id": security_map[symbol], "current_price": q["current"],
-                "ohlc": {"open": q["open"], "high": q["high"], "low": q["low"], "close": q["close"]},
-                "session_high": q["high"], "session_low": q["low"],
-                "previous_day": {"high": None, "low": None, "close": None}, "volume": q["volume"],
-                "candles": {"1m": [], "5m": [], "15m": [], "1h": []}, "vwap": None, "ema9": None, "ema20": None,
+                "symbol": symbol,
+                "security_id": security_map[symbol],
+                "current_price": q["current"],
+                "ohlc": {"open": None, "high": None, "low": None, "close": None},
+                "session_high": None,
+                "session_low": None,
+                "previous_day": {"high": None, "low": None, "close": None},
+                "volume": q["volume"],
+                "candles": {"1m": [], "5m": [], "15m": [], "1h": []},
+                "vwap": None,
+                "ema9": None,
+                "ema20": None,
                 "opening_range": {"period": "09:15-09:30", "status": "FORMING", "high": None, "low": None},
                 "structure": {"trend": "INSUFFICIENT_DATA", "swing_high": None, "swing_low": None},
-                "timestamp": now.isoformat(), "trading_date": now.date().isoformat(),
-                "market_session_status": main.session_status(now), "data_source_status": "LIVE", "last_tick": None,
-                "_one_min": [], "_volume_anchor": None,
+                "timestamp": now.isoformat(),
+                "trading_date": now.date().isoformat(),
+                "market_session_status": main.session_status(now),
+                "data_source_status": "LIVE",
+                "last_tick": None,
+                "_one_min": [],
+                "_volume_anchor": None,
             }
 
 
@@ -167,10 +202,34 @@ def _restore_checkpoint_if_needed(trading_date):
             current["_volume_anchor"] = None
 
 
+def _canonical_session_ohlc(one_min):
+    if not one_min:
+        raise DataIntegrityError("1m candle history missing")
+    for row in one_min:
+        validate_ohlcv_row(row, main.now_ist().date().isoformat())
+    return {
+        "open": one_min[0]["open"],
+        "high": max(row["high"] for row in one_min),
+        "low": min(row["low"] for row in one_min),
+        "close": one_min[-1]["close"],
+    }
+
+
 def _validated_rebuild_stock(symbol, one_min, quote, prev):
     validated = validate_intraday_rows(one_min, main.now_ist().date().isoformat())
-    clean_quote = validate_quote(quote)
-    main._original_rebuild_stock(symbol, validated, clean_quote, prev)
+    live = validate_live_quote(quote)
+    session_ohlc = _canonical_session_ohlc(validated)
+    canonical_quote = {
+        "current": live["current"],
+        "open": session_ohlc["open"],
+        "high": session_ohlc["high"],
+        "low": session_ohlc["low"],
+        "close": session_ohlc["close"],
+        "volume": live["volume"],
+    }
+    validate_quote(canonical_quote)
+    main._original_rebuild_stock(symbol, validated, canonical_quote, prev)
+
 
 main._original_rebuild_stock = main.rebuild_stock
 main.rebuild_stock = _validated_rebuild_stock
@@ -181,12 +240,37 @@ def _guarded_update_tick(symbol, price, volume, ltt_epoch, day_open, day_high, d
     with main.lock:
         stock = main.state["stocks"].get(symbol)
         previous_volume = stock.get("volume") if stock else None
+        last_epoch = stock.get("_one_min", [])[-1]["epoch"] if stock and stock.get("_one_min") else None
     try:
-        clean = validate_tick(price, volume, ltt_epoch, day_open, day_high, day_low, now, previous_volume)
+        clean_price, clean_volume, clean_ltt = validate_live_tick(price, volume, ltt_epoch, now, previous_volume)
+        if last_epoch is not None and clean_ltt < int(last_epoch):
+            raise DataIntegrityError("out-of-order live tick")
     except DataIntegrityError as exc:
         main.log.warning("Rejected corrupt live tick for %s: %s", symbol, exc)
         return
-    main._original_update_tick(symbol, *clean)
+
+    # main.update_tick still receives the original signature, but its broker
+    # aggregate OHLC arguments are deliberately replaced by the current LTP.
+    # Immediately after the call, canonical session OHLC is recomputed from
+    # the validated 1m candle stream, so broker aggregate OHLC cannot poison it.
+    main._original_update_tick(symbol, clean_price, clean_volume, clean_ltt, clean_price, clean_price, clean_price)
+
+    with main.lock:
+        stock = main.state["stocks"].get(symbol)
+        if not stock:
+            return
+        candles = stock.get("_one_min", [])
+        if not candles:
+            raise DataIntegrityError("live tick produced no 1m candle")
+        session_ohlc = _canonical_session_ohlc(candles)
+        stock["ohlc"] = session_ohlc
+        stock["session_high"] = session_ohlc["high"]
+        stock["session_low"] = session_ohlc["low"]
+        stock["current_price"] = clean_price
+        stock["volume"] = clean_volume
+        stock["last_tick"] = datetime.fromtimestamp(clean_ltt, main.IST).isoformat()
+        validate_quote({**session_ohlc, "current": clean_price, "volume": clean_volume})
+
 
 main._original_update_tick = main.update_tick
 main.update_tick = _guarded_update_tick
@@ -205,7 +289,14 @@ def _backfill_worker(token, security_map):
                 s = main.state["stocks"].get(symbol)
                 if not s:
                     continue
-                quote = {"current": s.get("current_price"), "open": s.get("ohlc", {}).get("open"), "high": s.get("ohlc", {}).get("high"), "low": s.get("ohlc", {}).get("low"), "close": s.get("ohlc", {}).get("close"), "volume": s.get("volume")}
+                quote = {
+                    "current": s.get("current_price"),
+                    "open": None,
+                    "high": None,
+                    "low": None,
+                    "close": None,
+                    "volume": s.get("volume"),
+                }
                 last_tick, status = s.get("last_tick"), s.get("data_source_status")
             main.rebuild_stock(symbol, one_min, quote, prev)
             with main.lock:
@@ -258,7 +349,15 @@ def _supervisor():
 
 def _machine_payload():
     with main.lock:
-        raw = {"service": "PSY29 Live Data", "timestamp": main.now_ist().isoformat(), "trading_date": main.state["trading_date"], "market_session_status": main.state["market_session_status"], "data_source_status": main.state["source_status"], "stocks_expected": 29, "stocks": {k: main.clean_stock(v) for k, v in main.state["stocks"].items()}}
+        raw = {
+            "service": "PSY29 Live Data",
+            "timestamp": main.now_ist().isoformat(),
+            "trading_date": main.state["trading_date"],
+            "market_session_status": main.state["market_session_status"],
+            "data_source_status": main.state["source_status"],
+            "stocks_expected": 29,
+            "stocks": {k: main.clean_stock(v) for k, v in main.state["stocks"].items()},
+        }
     unsafe = []
     for symbol, stock in raw["stocks"].items():
         try:
@@ -277,26 +376,73 @@ def _machine_payload():
             one_min = candles.get("1m", [])
             if not one_min:
                 raise DataIntegrityError("1m candle history missing")
+            expected_ohlc = _canonical_session_ohlc(one_min)
+            supplied_ohlc = stock.get("ohlc") or {}
+            for key in ("open", "high", "low", "close"):
+                supplied = supplied_ohlc.get(key)
+                expected = expected_ohlc[key]
+                if supplied is None or not math.isfinite(float(supplied)) or abs(float(supplied) - expected) > max(0.01, abs(expected) * 0.0001):
+                    raise DataIntegrityError(f"session OHLC {key} does not match validated 1m candles")
+            if stock.get("session_high") != expected_ohlc["high"] or stock.get("session_low") != expected_ohlc["low"]:
+                raise DataIntegrityError("session range does not match validated 1m candles")
+            current = stock.get("current_price")
+            if current is None or not math.isfinite(float(current)):
+                raise DataIntegrityError("invalid current_price")
+            if not expected_ohlc["low"] <= float(current) <= expected_ohlc["high"]:
+                raise DataIntegrityError("current_price outside validated session range")
             for key, expected in (("vwap", main.calc_vwap(one_min)), ("ema9", main.calc_ema(one_min, 9)), ("ema20", main.calc_ema(one_min, 20))):
                 supplied = stock.get(key)
                 if supplied is None or expected is None or not math.isfinite(float(supplied)) or abs(float(supplied) - expected) > max(0.01, abs(expected) * 0.0001):
                     raise DataIntegrityError(f"{key} does not match validated candles")
-            validate_quote({"current": stock.get("current_price"), "open": stock.get("ohlc", {}).get("open"), "high": stock.get("ohlc", {}).get("high"), "low": stock.get("ohlc", {}).get("low"), "close": stock.get("ohlc", {}).get("close"), "volume": stock.get("volume")})
+            validate_quote({
+                "current": current,
+                "open": expected_ohlc["open"],
+                "high": expected_ohlc["high"],
+                "low": expected_ohlc["low"],
+                "close": expected_ohlc["close"],
+                "volume": stock.get("volume"),
+            })
             if stock.get("last_tick") and datetime.fromisoformat(stock["last_tick"]).date().isoformat() != raw["trading_date"]:
                 raise DataIntegrityError("last_tick date mismatch")
         except (DataIntegrityError, TypeError, ValueError, OverflowError) as exc:
             unsafe.append(f"{symbol}: {exc}")
     if unsafe:
         raw["data_source_status"] = "DATA_UNSAFE"
-        raw["diagnostic"] = {"status": "ERROR", "error_code": "DATA_INTEGRITY_FAILURE", "error_message": "; ".join(unsafe), "stage": "PUBLIC_GATE", "affected_stocks": [x.split(":",1)[0] for x in unsafe], "recovery_action": "REJECT_PAYLOAD_AND_REFRESH_FROM_DHAN", "data_safe": False}
+        raw["diagnostic"] = {
+            "status": "ERROR",
+            "error_code": "DATA_INTEGRITY_FAILURE",
+            "error_message": "; ".join(unsafe),
+            "stage": "PUBLIC_GATE",
+            "affected_stocks": [x.split(":", 1)[0] for x in unsafe],
+            "recovery_action": "REJECT_PAYLOAD_AND_REFRESH_FROM_DHAN",
+            "data_safe": False,
+        }
     else:
-        raw["diagnostic"] = {"status": "OK", "error_code": None, "error_message": None, "stage": None, "affected_stocks": [], "recovery_action": None, "data_safe": True}
+        raw["diagnostic"] = {
+            "status": "OK",
+            "error_code": None,
+            "error_message": None,
+            "stage": None,
+            "affected_stocks": [],
+            "recovery_action": None,
+            "data_safe": True,
+        }
     return main.normalize_market(raw)
 
 
 def _json_response():
     body = _machine_payload()
-    return JSONResponse(content=body, headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0", "Pragma": "no-cache", "Expires": "0", "Surrogate-Control": "no-store", "Access-Control-Allow-Origin": "*", "X-Content-Type-Options": "nosniff"})
+    return JSONResponse(
+        content=body,
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
+            "Surrogate-Control": "no-store",
+            "Access-Control-Allow-Origin": "*",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 @main.app.get("/api/v1/live.json")
@@ -317,7 +463,16 @@ def data_json():
 @main.app.get("/data.txt")
 def data_txt():
     body = json.dumps(_machine_payload(), separators=(",", ":"), ensure_ascii=False)
-    return Response(content=body, media_type="text/plain", headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0", "Pragma": "no-cache", "Expires": "0", "Access-Control-Allow-Origin": "*"})
+    return Response(
+        content=body,
+        media_type="text/plain",
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
+            "Access-Control-Allow-Origin": "*",
+        },
+    )
 
 
 @main.app.get("/live.txt")
@@ -331,8 +486,10 @@ def startup():
     threading.Thread(target=_checkpoint_worker, daemon=True, name="psy29-db-checkpoint").start()
     threading.Thread(target=_supervisor, daemon=True, name="psy29-supervisor").start()
 
+
 main.app.add_event_handler("startup", startup)
 app = main.app
+
 
 if __name__ == "__main__":
     import uvicorn
