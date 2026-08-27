@@ -14,6 +14,7 @@ main.app.router.on_startup.clear()
 
 store = IntradayStore()
 CHECKPOINT_SECONDS = 60.0
+AUTH_COOLDOWN_SECONDS = 125.0
 
 
 def _snapshot() -> tuple[str | None, dict]:
@@ -163,6 +164,13 @@ def _supervisor() -> None:
                 continue
             time.sleep(3)
         except Exception as exc:
+            message = str(exc)
+            if "Token can be generated once every 2 minutes" in message:
+                with main.lock:
+                    main.state["source_status"] = "AUTH_COOLDOWN"
+                main.log.warning("Dhan auth cooldown active; waiting %.0fs before retry", AUTH_COOLDOWN_SECONDS)
+                time.sleep(AUTH_COOLDOWN_SECONDS)
+                continue
             main.log.exception("Collector supervisor failure: %s", exc)
             with main.lock:
                 main.state["source_status"] = "ERROR"
