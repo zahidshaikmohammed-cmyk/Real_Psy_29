@@ -1,7 +1,9 @@
+import json
 import threading
 import time
 
 import main
+from fastapi.responses import Response
 from psy29.intraday_store import IntradayStore
 
 
@@ -92,7 +94,6 @@ def _restore_checkpoint_if_needed(trading_date: str) -> None:
             if not current:
                 main.state["stocks"][symbol] = payload
                 continue
-            # Preserve the fresh quote, but restore durable candle/history state.
             saved_candles = payload.get("candles")
             if isinstance(saved_candles, dict):
                 current["candles"] = saved_candles
@@ -166,6 +167,42 @@ def _supervisor() -> None:
             with main.lock:
                 main.state["source_status"] = "ERROR"
             time.sleep(5)
+
+
+def _machine_payload() -> dict:
+    with main.lock:
+        raw = {
+            "service": "PSY29 Live Data",
+            "timestamp": main.now_ist().isoformat(),
+            "trading_date": main.state["trading_date"],
+            "market_session_status": main.state["market_session_status"],
+            "data_source_status": main.state["source_status"],
+            "stocks_expected": 29,
+            "stocks": {k: main.clean_stock(v) for k, v in main.state["stocks"].items()},
+        }
+    return main.normalize_market(raw)
+
+
+# Plain-text JSON endpoint. Some fetch/crawler layers handle text resources more
+# reliably than application/json responses from dynamic Render services.
+@main.app.get("/data.txt")
+def data_txt():
+    body = json.dumps(_machine_payload(), separators=(",", ":"), ensure_ascii=False)
+    return Response(
+        content=body,
+        media_type="text/plain",
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
+            "Access-Control-Allow-Origin": "*",
+        },
+    )
+
+
+@main.app.get("/live.txt")
+def live_txt():
+    return data_txt()
 
 
 def startup() -> None:
