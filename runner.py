@@ -16,6 +16,7 @@ from psy29.data_integrity import (
     validate_quote,
     validate_ohlcv_row,
 )
+from psy29.session_reset import reset_for_trading_date
 
 main.app.router.on_startup.clear()
 store = IntradayStore()
@@ -43,8 +44,6 @@ def _parse_quote_packet(data: bytes):
         return None
     if volume < 0 or ltq < 0 or total_sell < 0 or total_buy < 0:
         return None
-    # The broker packet is parsed strictly, but its aggregate day OHLC is not
-    # promoted to canonical session state. Validated 1m candles own that state.
     return security_id, ltp, volume, ltt, day_open, day_high, day_low
 
 
@@ -81,9 +80,6 @@ def _validated_market_quote(token, client_id, security_map):
     for symbol in main.STOCKS:
         try:
             live = validate_live_quote(raw.get(symbol))
-            # Keep only independently validated live quote fields. Broker
-            # aggregate OHLC is intentionally quarantined; session OHLC comes
-            # from validated 1m candles in _validated_rebuild_stock.
             clean[symbol] = {
                 "current": live["current"],
                 "open": None,
@@ -248,13 +244,7 @@ def _guarded_update_tick(symbol, price, volume, ltt_epoch, day_open, day_high, d
     except DataIntegrityError as exc:
         main.log.warning("Rejected corrupt live tick for %s: %s", symbol, exc)
         return
-
-    # main.update_tick still receives the original signature, but its broker
-    # aggregate OHLC arguments are deliberately replaced by the current LTP.
-    # Immediately after the call, canonical session OHLC is recomputed from
-    # the validated 1m candle stream, so broker aggregate OHLC cannot poison it.
     main._original_update_tick(symbol, clean_price, clean_volume, clean_ltt, clean_price, clean_price, clean_price)
-
     with main.lock:
         stock = main.state["stocks"].get(symbol)
         if not stock:
@@ -314,6 +304,8 @@ def _supervisor():
     while True:
         try:
             now = main.now_ist()
+            with main.lock:
+                reset_for_trading_date(main.state, now.date())
             if not main.in_session(now):
                 with main.lock:
                     main.state["market_session_status"] = main.session_status(now)
@@ -349,6 +341,7 @@ def _supervisor():
 
 def _machine_payload():
     with main.lock:
+        reset_for_trading_date(main.state, main.now_ist().date())
         raw = {
             "service": "PSY29 Live Data",
             "timestamp": main.now_ist().isoformat(),
@@ -432,17 +425,7 @@ def _machine_payload():
 
 def _json_response():
     body = _machine_payload()
-    return JSONResponse(
-        content=body,
-        headers={
-            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
-            "Pragma": "no-cache",
-            "Expires": "0",
-            "Surrogate-Control": "no-store",
-            "Access-Control-Allow-Origin": "*",
-            "X-Content-Type-Options": "nosniff",
-        },
-    )
+    return JSONResponse(content=body, headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0", "Pragma": "no-cache", "Expires": "0", "Surrogate-Control": "no-store", "Access-Control-Allow-Origin": "*", "X-Content-Type-Options": "nosniff"})
 
 
 @main.app.get("/api/v1/live.json")
@@ -463,16 +446,7 @@ def data_json():
 @main.app.get("/data.txt")
 def data_txt():
     body = json.dumps(_machine_payload(), separators=(",", ":"), ensure_ascii=False)
-    return Response(
-        content=body,
-        media_type="text/plain",
-        headers={
-            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
-            "Pragma": "no-cache",
-            "Expires": "0",
-            "Access-Control-Allow-Origin": "*",
-        },
-    )
+    return Response(content=body, media_type="text/plain", headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0", "Pragma": "no-cache", "Expires": "0", "Access-Control-Allow-Origin": "*"})
 
 
 @main.app.get("/live.txt")
