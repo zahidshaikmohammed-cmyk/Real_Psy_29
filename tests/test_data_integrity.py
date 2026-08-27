@@ -2,7 +2,14 @@ from datetime import datetime
 
 import pytest
 
-from psy29.data_integrity import DataIntegrityError, validate_intraday_rows, validate_quote, validate_tick
+from psy29.data_integrity import (
+    DataIntegrityError,
+    validate_intraday_rows,
+    validate_live_quote,
+    validate_live_tick,
+    validate_quote,
+    validate_tick,
+)
 
 
 TRADING_DATE = "2026-08-27"
@@ -38,11 +45,30 @@ def test_rejects_quote_current_outside_day_range():
         validate_quote({"current": 0.0001, "open": 1900, "high": 1910, "low": 1890, "close": 1880, "volume": 1000})
 
 
+def test_strict_quote_rejects_impossible_ohlc():
+    with pytest.raises(DataIntegrityError, match="invalid quote OHLC bounds"):
+        validate_quote({"current": 1900, "open": 1900, "high": 1890, "low": 1880, "close": 1885, "volume": 1000})
+
+
+def test_live_quote_keeps_ltp_separate_from_broker_aggregate_ohlc():
+    live = validate_live_quote({"current": 1900, "open": 2500, "high": 2400, "low": 1000, "close": 2300, "volume": 1000})
+    assert live == {"current": 1900.0, "volume": 1000}
+
+
 def test_rejects_future_live_tick():
     now = datetime.fromisoformat("2026-08-27T10:00:00+05:30")
     future_epoch = int(now.timestamp()) + 30
     with pytest.raises(DataIntegrityError):
         validate_tick(1900, 1000, future_epoch, 1890, 1910, 1880, now)
+    with pytest.raises(DataIntegrityError):
+        validate_live_tick(1900, 1000, future_epoch, now)
+
+
+def test_rejects_stale_live_tick():
+    now = datetime.fromisoformat("2026-08-27T10:00:00+05:30")
+    stale_epoch = int(now.timestamp()) - 301
+    with pytest.raises(DataIntegrityError, match="stale live tick"):
+        validate_live_tick(1900, 1000, stale_epoch, now)
 
 
 def test_accepts_valid_current_session_data():
@@ -50,3 +76,5 @@ def test_accepts_valid_current_session_data():
     assert rows[0]["close"] == 1901.0
     quote = validate_quote({"current": 1901, "open": 1890, "high": 1910, "low": 1880, "close": 1875, "volume": 1000})
     assert quote["current"] == 1901
+    live = validate_live_tick(1901, 1000, int(datetime.fromisoformat("2026-08-27T09:16:00+05:30").timestamp()), datetime.fromisoformat("2026-08-27T09:16:02+05:30"))
+    assert live[:2] == (1901.0, 1000)
