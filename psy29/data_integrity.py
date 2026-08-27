@@ -43,7 +43,7 @@ def _normalize_epoch_seconds(value: object) -> int:
     return raw
 
 
-def validate_ohlcv_row(row: dict, trading_date: str, *, session_only: bool = True) -> dict:
+def validate_ohlcv_row(row: dict, trading_date: str, *, session_only: bool = True, allow_zero_volume: bool = False) -> dict:
     try:
         ts = datetime.fromisoformat(str(row["timestamp"]))
         epoch = int(row["epoch"])
@@ -61,7 +61,7 @@ def validate_ohlcv_row(row: dict, trading_date: str, *, session_only: bool = Tru
         raise DataIntegrityError("candle timestamp is not minute-aligned")
     if abs(ts.timestamp() - epoch) > 1:
         raise DataIntegrityError("candle epoch does not match timestamp")
-    if volume <= 0:
+    if volume <= 0 and not allow_zero_volume:
         raise DataIntegrityError("zero/negative candle volume")
     opn, high, low, close = values
     if high < max(opn, close) or low > min(opn, close) or high < low:
@@ -74,16 +74,24 @@ def validate_intraday_rows(rows: object, trading_date: str) -> list[dict]:
         raise DataIntegrityError("empty intraday history")
     valid: list[dict] = []
     previous_epoch = None
+    rejected_zero_volume = 0
     for index, row in enumerate(rows):
         if not isinstance(row, dict):
             raise DataIntegrityError(f"malformed candle at index {index}")
-        clean = validate_ohlcv_row(row, trading_date)
+        clean = validate_ohlcv_row(row, trading_date, allow_zero_volume=True)
         epoch = int(clean["epoch"])
         if previous_epoch is not None and epoch <= previous_epoch:
             if epoch == previous_epoch:
                 raise DataIntegrityError("duplicate candle")
             raise DataIntegrityError("non-chronological candle")
         previous_epoch = epoch
+        if int(clean.get("volume", 0)) <= 0:
+            rejected_zero_volume += 1
+            logging.getLogger("psy29.data_integrity").warning(
+                "Quarantined intraday candle index=%d timestamp=%s reason=zero/negative candle volume",
+                index, clean.get("timestamp")
+            )
+            continue
         valid.append(clean)
     if len(valid) < 15:
         raise DataIntegrityError(f"insufficient valid intraday history: {len(valid)} rows")
