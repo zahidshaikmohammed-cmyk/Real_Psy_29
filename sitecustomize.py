@@ -55,6 +55,51 @@ except Exception:
     pass
 
 
+def _install_dhan_auth_guard():
+    """Serialize TOTP login and never hammer Dhan with the same OTP window."""
+    app = sys.modules.get("__main__")
+    if app is None or not hasattr(app, "generate_access_token"):
+        return
+    if getattr(app, "_psy29_dhan_auth_guard_installed", False):
+        return
+
+    original_generate = app.generate_access_token
+    auth_lock = threading.Lock()
+
+    def guarded_generate_access_token():
+        with auth_lock:
+            secret = os.getenv("DHAN_TOTP_SECRET")
+            if secret:
+                normalized = "".join(secret.split()).upper()
+                if normalized != secret:
+                    os.environ["DHAN_TOTP_SECRET"] = normalized
+
+            try:
+                return original_generate()
+            except Exception as exc:
+                if "Invalid TOTP" not in str(exc):
+                    raise
+
+                # Dhan TOTP is a 30-second code. A restarted Render instance
+                # can collide with another instance that just consumed the
+                # current code. Wait for the next code before one retry rather
+                # than repeatedly submitting the same code every few seconds.
+                wait = max(1.0, 31.0 - (time.time() % 30.0))
+                log = getattr(app, "log", None)
+                if log:
+                    log.warning("Dhan TOTP rejected; waiting for next TOTP window before one retry")
+                time.sleep(wait)
+                try:
+                    return original_generate()
+                except Exception as retry_exc:
+                    if "Invalid TOTP" in str(retry_exc) and log:
+                        log.error("Dhan TOTP retry failed; preserving authentication failure state")
+                    raise
+
+    app.generate_access_token = guarded_generate_access_token
+    app._psy29_dhan_auth_guard_installed = True
+
+
 def _supervise_psy29_collector():
     app = sys.modules.get("__main__")
     if app is None:
@@ -147,6 +192,7 @@ def _patched_start(self, *args, **kwargs):
         self._args = ()
         self._kwargs = {}
     if name == "psy29-supervisor":
+        _install_dhan_auth_guard()
         _start_psy29_github_master_publisher()
     return _ORIGINAL_START(self, *args, **kwargs)
 
