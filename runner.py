@@ -27,18 +27,18 @@ AUTH_COOLDOWN_SECONDS = 125.0
 def _parse_quote_packet(data: bytes):
     if len(data) < 51 or data[0] != 4:
         return None
-    security_id = struct.unpack_from("<i", data, 4)[0]
-    ltp = struct.unpack_from("<f", data, 8)[0]
-    ltq = struct.unpack_from("<h", data, 12)[0]
-    ltt = struct.unpack_from("<i", data, 14)[0]
-    atp = struct.unpack_from("<f", data, 18)[0]
-    volume = struct.unpack_from("<i", data, 22)[0]
-    total_sell = struct.unpack_from("<i", data, 26)[0]
-    total_buy = struct.unpack_from("<i", data, 30)[0]
-    day_open = struct.unpack_from("<f", data, 34)[0]
-    day_close = struct.unpack_from("<f", data, 38)[0]
-    day_high = struct.unpack_from("<f", data, 42)[0]
-    day_low = struct.unpack_from("<f", data, 46)[0]
+    security_id = struct.unpack_from("<I", data, 4)[0]
+    ltp = struct.unpack_from("<f", data, 9)[0]
+    ltq = struct.unpack_from("<h", data, 13)[0]
+    ltt = struct.unpack_from("<I", data, 15)[0]
+    atp = struct.unpack_from("<f", data, 19)[0]
+    volume = struct.unpack_from("<I", data, 23)[0]
+    total_sell = struct.unpack_from("<I", data, 27)[0]
+    total_buy = struct.unpack_from("<I", data, 31)[0]
+    day_open = struct.unpack_from("<f", data, 35)[0]
+    day_close = struct.unpack_from("<f", data, 39)[0]
+    day_high = struct.unpack_from("<f", data, 43)[0]
+    day_low = struct.unpack_from("<f", data, 47)[0]
     prices = (ltp, atp, day_open, day_close, day_high, day_low)
     if not all(math.isfinite(v) for v in prices) or ltp <= 0 or atp < 0 or day_open <= 0 or day_high <= 0 or day_low <= 0:
         return None
