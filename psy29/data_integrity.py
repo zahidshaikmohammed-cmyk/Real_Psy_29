@@ -137,11 +137,38 @@ def _install_canonical_ws_parser():
     main=sys.modules.get("main")
     if main is None: return
     def parse_quote_packet(data:bytes):
-        if len(data)<50 or data[0]!=4: return None
-        security_id=struct.unpack_from("<i",data,4)[0]; ltp=struct.unpack_from("<f",data,8)[0]; ltq=struct.unpack_from("<h",data,12)[0]; ltt=struct.unpack_from("<i",data,14)[0]; atp=struct.unpack_from("<f",data,18)[0]; volume=struct.unpack_from("<i",data,22)[0]; total_sell=struct.unpack_from("<i",data,26)[0]; total_buy=struct.unpack_from("<i",data,30)[0]; day_open=struct.unpack_from("<f",data,34)[0]; day_close=struct.unpack_from("<f",data,38)[0]; day_high=struct.unpack_from("<f",data,42)[0]; day_low=struct.unpack_from("<f",data,46)[0]
+        # DhanHQ v2 Quote packet: 8-byte header, then fields at byte offsets 9, 13, 15, 19, 23, 27, 31, 35, 39, 43, 47.
+        # The offsets are documented by DhanHQ; the previous hardening parser was one byte early after the header.
+        if len(data)<51 or data[0]!=4: return None
+        security_id=struct.unpack_from("<I",data,4)[0]
+        ltp=struct.unpack_from("<f",data,9)[0]
+        ltq=struct.unpack_from("<h",data,13)[0]
+        ltt=struct.unpack_from("<i",data,15)[0]
+        atp=struct.unpack_from("<f",data,19)[0]
+        volume=struct.unpack_from("<i",data,23)[0]
+        total_sell=struct.unpack_from("<i",data,27)[0]
+        total_buy=struct.unpack_from("<i",data,31)[0]
+        day_open=struct.unpack_from("<f",data,35)[0]
+        day_close=struct.unpack_from("<f",data,39)[0]
+        day_high=struct.unpack_from("<f",data,43)[0]
+        day_low=struct.unpack_from("<f",data,47)[0]
         values=(ltp,atp,day_open,day_close,day_high,day_low)
         if not all(math.isfinite(v) for v in values) or any(v<=0 for v in (ltp,day_open,day_high,day_low)) or atp<0 or volume<=0 or ltq<0 or total_sell<0 or total_buy<0: return None
         return security_id,ltp,volume,ltt,day_open,day_high,day_low
     main.parse_quote_packet=parse_quote_packet; main._psy29_ws_parser_canonical=True
+    # runner.py historically reassigns main.parse_quote_packet after this module imports.
+    # Guard the websocket boundary so the canonical Dhan parser is always used at runtime.
+    if hasattr(main,"websocket_loop") and not getattr(main,"_psy29_ws_loop_guard_installed",False):
+        original_loop=main.websocket_loop
+        async def guarded_websocket_loop(token):
+            previous_parser=getattr(main,"parse_quote_packet",None)
+            main.parse_quote_packet=parse_quote_packet
+            try:
+                return await original_loop(token)
+            finally:
+                if previous_parser is not None:
+                    main.parse_quote_packet=previous_parser
+        main.websocket_loop=guarded_websocket_loop
+        main._psy29_ws_loop_guard_installed=True
 
 _install_quote_boundary_diagnostics(); _install_canonical_ws_parser()
