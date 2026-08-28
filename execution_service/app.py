@@ -8,7 +8,7 @@ from typing import Any
 
 import requests
 from fastapi import FastAPI
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 
 from psy29.execution_master_builder import build_execution_master
 
@@ -136,7 +136,7 @@ def _status_from_source(payload, code, message):
 
 @app.get("/")
 def root():
-    return {"service": "PSY29 Execution Enrichment", "status": "OK", "endpoints": ["/health", "/execution.json", "/status"]}
+    return {"service": "PSY29 Execution Enrichment", "status": "OK", "endpoints": ["/health", "/execution.json", "/execution.txt", "/status"]}
 
 
 @app.get("/health")
@@ -150,11 +150,10 @@ def status():
     return _status_from_source(payload, code, message)
 
 
-@app.get("/execution.json")
-def execution_json():
+def _execution_payload():
     payload, code, message = _get_cached_or_fetch()
     if payload is None:
-        return JSONResponse(status_code=503, content={"service": "PSY29 Execution Enrichment", "status": "SOURCE_UNAVAILABLE", "execution_enrichment": None, "error_code": code or "SOURCE_UNAVAILABLE", "error_message": message or "Source unavailable."})
+        return None, JSONResponse(status_code=503, content={"service": "PSY29 Execution Enrichment", "status": "SOURCE_UNAVAILABLE", "execution_enrichment": None, "error_code": code or "SOURCE_UNAVAILABLE", "error_message": message or "Source unavailable."})
     safe, gate_code, gate_message = _source_safe(payload)
     if not safe:
         result = copy.deepcopy(payload)
@@ -162,9 +161,25 @@ def execution_json():
         result["enrichment_status"] = "BLOCKED_SOURCE_UNSAFE"
         result["error_code"] = gate_code
         result["error_message"] = gate_message
-        return JSONResponse(content=result)
+        return result, None
     try:
-        result = build_execution_master(payload, generated_at=_utc_now())
+        return build_execution_master(payload, generated_at=_utc_now()), None
     except Exception as exc:
-        return JSONResponse(status_code=500, content={"service": "PSY29 Execution Enrichment", "status": "ENRICHMENT_FAILED", "execution_enrichment": None, "error_code": "ENRICHMENT_FAILED", "error_message": str(exc)})
+        return None, JSONResponse(status_code=500, content={"service": "PSY29 Execution Enrichment", "status": "ENRICHMENT_FAILED", "execution_enrichment": None, "error_code": "ENRICHMENT_FAILED", "error_message": str(exc)})
+
+
+@app.get("/execution.json")
+def execution_json():
+    result, error = _execution_payload()
+    if error is not None:
+        return error
     return JSONResponse(content=result)
+
+
+@app.get("/execution.txt")
+def execution_txt():
+    result, error = _execution_payload()
+    if error is not None:
+        return PlainTextResponse(error.body.decode("utf-8"), status_code=error.status_code, media_type="text/plain")
+    import json
+    return PlainTextResponse(json.dumps(result, ensure_ascii=False, separators=(",", ":")), media_type="text/plain")
