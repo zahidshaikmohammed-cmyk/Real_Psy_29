@@ -1,9 +1,13 @@
 from datetime import datetime
+import struct
 
 import pytest
 
 from psy29.data_integrity import (
+    DHAN_QUOTE_PACKET_FORMAT,
+    DHAN_QUOTE_PACKET_SIZE,
     DataIntegrityError,
+    parse_dhan_quote_packet,
     validate_intraday_rows,
     validate_live_quote,
     validate_live_tick,
@@ -78,3 +82,60 @@ def test_accepts_valid_current_session_data():
     assert quote["current"] == 1901
     live = validate_live_tick(1901, 1000, int(datetime.fromisoformat("2026-08-27T09:16:00+05:30").timestamp()), datetime.fromisoformat("2026-08-27T09:16:02+05:30"))
     assert live[:2] == (1901.0, 1000)
+
+
+def test_dhan_quote_packet_uses_zero_based_wire_offsets():
+    packet = struct.pack(
+        DHAN_QUOTE_PACKET_FORMAT,
+        4,
+        DHAN_QUOTE_PACKET_SIZE,
+        1,
+        1333,
+        285.25,
+        17,
+        1787891400,
+        284.75,
+        123456,
+        700,
+        900,
+        280.0,
+        0.0,
+        290.0,
+        275.0,
+    )
+    parsed = parse_dhan_quote_packet(packet)
+    assert parsed is not None
+    security_id, ltp, volume, ltt, day_open, day_high, day_low = parsed
+    assert security_id == 1333
+    assert ltp == pytest.approx(285.25)
+    assert volume == 123456
+    assert ltt == 1787891400
+    assert day_open == pytest.approx(280.0)
+    assert day_high == pytest.approx(290.0)
+    assert day_low == pytest.approx(275.0)
+
+
+def test_dhan_quote_packet_rejects_bad_framing_and_wrong_segment():
+    packet = struct.pack(
+        DHAN_QUOTE_PACKET_FORMAT,
+        4,
+        DHAN_QUOTE_PACKET_SIZE,
+        2,
+        1333,
+        285.25,
+        17,
+        1787891400,
+        284.75,
+        123456,
+        700,
+        900,
+        280.0,
+        0.0,
+        290.0,
+        275.0,
+    )
+    assert parse_dhan_quote_packet(packet) is None
+    bad_length = bytearray(packet)
+    bad_length[1:3] = struct.pack("<H", 49)
+    assert parse_dhan_quote_packet(bytes(bad_length)) is None
+    assert parse_dhan_quote_packet(packet[:DHAN_QUOTE_PACKET_SIZE - 1]) is None
