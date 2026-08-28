@@ -66,7 +66,11 @@ def publish_once() -> bool:
     sha, existing = _current(token)
     if existing is not None and hashlib.sha256(existing).digest() == hashlib.sha256(content).digest():
         return True
-    body: dict[str, Any] = {"message": "Update validated PSY29 master data", "content": base64.b64encode(content).decode("ascii"), "branch": BRANCH}
+    body: dict[str, Any] = {
+        "message": "Update validated PSY29 master data [skip render]",
+        "content": base64.b64encode(content).decode("ascii"),
+        "branch": BRANCH,
+    }
     if sha:
         body["sha"] = sha
     r = requests.put(API_URL, headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}, json=body, timeout=20)
