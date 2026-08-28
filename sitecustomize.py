@@ -213,4 +213,20 @@ def _github_master_bootstrap():
         time.sleep(0.5)
 
 
+def _runner_supervisor_bootstrap():
+    """Guarantee the live-data supervisor exists even if FastAPI startup hooks race."""
+    for _ in range(120):
+        process = sys.modules.get("__main__")
+        if process is not None and hasattr(process, "_supervisor"):
+            if any(t.name == "psy29-supervisor" and t.is_alive() for t in threading.enumerate()):
+                return
+            if getattr(process, "_psy29_supervisor_bootstrap_started", False):
+                return
+            process._psy29_supervisor_bootstrap_started = True
+            threading.Thread(target=process._supervisor, daemon=True, name="psy29-supervisor").start()
+            return
+        time.sleep(0.5)
+
+
 threading.Thread(target=_github_master_bootstrap, name="psy29-github-master-bootstrap", daemon=True).start()
+threading.Thread(target=_runner_supervisor_bootstrap, name="psy29-supervisor-bootstrap", daemon=True).start()
