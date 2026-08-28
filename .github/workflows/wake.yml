@@ -13,4 +13,4 @@ jobs:
     steps:
       - name: Wake PSY29 live collector
         run: |
-          curl --fail --silent --show-error --max-time 30 https://psy29-live-data.onrender.com/health
+          curl --fail --silent --show-error --max-time 30 https://psy29-live-data-hardening.onrender.com/health
