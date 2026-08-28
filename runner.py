@@ -22,6 +22,7 @@ main.app.router.on_startup.clear()
 store = IntradayStore()
 CHECKPOINT_SECONDS = 60.0
 AUTH_COOLDOWN_SECONDS = 125.0
+BACKFILL_RETRY_SECONDS = 15.0
 
 
 def _parse_quote_packet(data: bytes):
@@ -267,37 +268,58 @@ main.update_tick = _guarded_update_tick
 
 
 def _backfill_worker(token, security_map):
+    pending = set(main.STOCKS)
+    retry_at = {symbol: 0.0 for symbol in pending}
     today = main.now_ist()
-    for symbol in main.STOCKS:
-        if not main.in_session(main.now_ist()):
-            return
-        try:
-            from_dt = today.replace(hour=9, minute=15, second=0, microsecond=0)
-            one_min = main.fetch_intraday_1m(token, security_map[symbol], from_dt, main.now_ist())
-            prev = main.fetch_previous_day(token, security_map[symbol], today)
-            with main.lock:
-                s = main.state["stocks"].get(symbol)
-                if not s:
-                    continue
-                quote = {
-                    "current": s.get("current_price"),
-                    "open": None,
-                    "high": None,
-                    "low": None,
-                    "close": None,
-                    "volume": s.get("volume"),
-                }
-                last_tick, status = s.get("last_tick"), s.get("data_source_status")
-            main.rebuild_stock(symbol, one_min, quote, prev)
-            with main.lock:
-                if symbol in main.state["stocks"]:
-                    main.state["stocks"][symbol]["last_tick"] = last_tick
-                    if status == "LIVE":
-                        main.state["stocks"][symbol]["data_source_status"] = "LIVE"
-            time.sleep(0.22)
-        except Exception:
-            main.log.exception("Background backfill failed for %s", symbol)
-    _checkpoint(force=True)
+    from_dt = today.replace(hour=9, minute=15, second=0, microsecond=0)
+
+    while pending and main.in_session(main.now_ist()):
+        progressed = False
+        now_epoch = time.monotonic()
+        for symbol in list(pending):
+            if now_epoch < retry_at[symbol] or not main.in_session(main.now_ist()):
+                continue
+            try:
+                to_dt = main.now_ist()
+                one_min = main.fetch_intraday_1m(token, security_map[symbol], from_dt, to_dt)
+                prev = main.fetch_previous_day(token, security_map[symbol], to_dt)
+                with main.lock:
+                    s = main.state["stocks"].get(symbol)
+                    if not s:
+                        pending.discard(symbol)
+                        continue
+                    quote = {
+                        "current": s.get("current_price"),
+                        "open": None,
+                        "high": None,
+                        "low": None,
+                        "close": None,
+                        "volume": s.get("volume"),
+                    }
+                    last_tick = s.get("last_tick")
+                    status = s.get("data_source_status")
+                main.rebuild_stock(symbol, one_min, quote, prev)
+                with main.lock:
+                    current = main.state["stocks"].get(symbol)
+                    if current:
+                        current["last_tick"] = last_tick
+                        if status == "LIVE":
+                            current["data_source_status"] = "LIVE"
+                pending.discard(symbol)
+                progressed = True
+                main.log.info("Intraday backfill ready for %s; remaining=%d", symbol, len(pending))
+            except Exception as exc:
+                retry_at[symbol] = time.monotonic() + BACKFILL_RETRY_SECONDS
+                main.log.warning("Background backfill retry scheduled for %s: %s", symbol, exc)
+
+        if pending:
+            time.sleep(1.0 if progressed else min(BACKFILL_RETRY_SECONDS, 5.0))
+
+    if not pending:
+        main.log.info("Intraday backfill complete: %d/%d stocks", len(main.STOCKS), len(main.STOCKS))
+        _checkpoint(force=True)
+    elif not main.in_session(main.now_ist()):
+        main.log.warning("Intraday backfill stopped at session boundary: ready=%d/%d", len(main.STOCKS) - len(pending), len(main.STOCKS))
 
 
 def _supervisor():
