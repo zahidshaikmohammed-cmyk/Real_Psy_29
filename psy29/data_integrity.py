@@ -11,6 +11,7 @@ IST_CLOSE = time(15, 15)
 MIN_REASONABLE_EQUITY_PRICE = 0.01
 MAX_REASONABLE_EQUITY_PRICE = 10_000_000.0
 MAX_FUTURE_TICK_SKEW_SECONDS = 60
+MAX_ACCEPTABLE_CLOCK_SKEW_SECONDS = 3600
 DHAN_QUOTE_PACKET_FORMAT = "<BHBIfHIfIIIffff"
 DHAN_QUOTE_PACKET_SIZE = struct.calcsize(DHAN_QUOTE_PACKET_FORMAT)
 
@@ -47,12 +48,7 @@ def _normalize_epoch_seconds(value: object) -> int:
 
 
 def parse_dhan_quote_packet(data: bytes):
-    """Parse one DhanHQ v2 NSE_EQ Quote packet using the official wire layout.
-
-    The response header occupies bytes 0-7 (zero-based). The first payload
-    field, LTP, therefore starts at byte 8. The official DhanHQ Python client
-    uses the same ``<BHBIfHIfIIIffff`` layout and a 50-byte quote packet.
-    """
+    """Parse one DhanHQ v2 NSE_EQ Quote packet using the official wire layout."""
     if not isinstance(data, (bytes, bytearray, memoryview)):
         return None
     if len(data) < DHAN_QUOTE_PACKET_SIZE:
@@ -140,15 +136,27 @@ def _validated_tick(ltp, volume, ltt_epoch, now, previous_volume=None, max_excha
     ltt=_normalize_epoch_seconds(ltt_epoch)
     try: embedded_ts=datetime.fromtimestamp(ltt, now.tzinfo)
     except (OverflowError,OSError,ValueError) as exc: raise DataIntegrityError("invalid tick timestamp") from exc
+
     future=(embedded_ts-now).total_seconds()
-    if future>MAX_FUTURE_TICK_SKEW_SECONDS: raise DataIntegrityError("future live tick")
+    effective_ltt=ltt
+    if future>MAX_FUTURE_TICK_SKEW_SECONDS:
+        if future > MAX_ACCEPTABLE_CLOCK_SKEW_SECONDS:
+            raise DataIntegrityError("future live tick")
+        logging.getLogger("psy29.data_integrity").warning(
+            "Accepted Dhan exchange-clock skew: %.1fs; using receipt time for candle placement",
+            future,
+        )
+        effective_ltt=int(now.timestamp())
+        embedded_ts=now
+    elif future>5:
+        logging.getLogger("psy29.data_integrity").warning("Accepted exchange-clock skew on live tick: %.1fs",future)
+
     if embedded_ts.date()!=now.date(): raise DataIntegrityError("live tick timestamp outside current trading date")
     if not (IST_OPEN<=embedded_ts.timetz().replace(tzinfo=None)<IST_CLOSE): raise DataIntegrityError("live tick timestamp outside NSE session")
     if (now-embedded_ts).total_seconds()>max_exchange_age_seconds: raise DataIntegrityError("stale live tick")
     if not (IST_OPEN<=now.timetz().replace(tzinfo=None)<IST_CLOSE): raise DataIntegrityError("tick received outside current NSE session")
     if previous_volume is not None and vol<int(previous_volume): raise DataIntegrityError("live cumulative volume moved backwards")
-    if future>5: logging.getLogger("psy29.data_integrity").warning("Accepted exchange-clock skew on live tick: %.1fs",future)
-    return price,vol,ltt
+    return price,vol,effective_ltt
 
 
 def validate_live_tick(ltp, volume, ltt_epoch, now, previous_volume=None, *, max_exchange_age_seconds=300):
