@@ -11,9 +11,13 @@ IST_CLOSE = time(15, 15)
 MIN_REASONABLE_EQUITY_PRICE = 0.01
 MAX_REASONABLE_EQUITY_PRICE = 10_000_000.0
 MAX_FUTURE_TICK_SKEW_SECONDS = 60
+DHAN_QUOTE_PACKET_FORMAT = "<BHBIfHIfIIIffff"
+DHAN_QUOTE_PACKET_SIZE = struct.calcsize(DHAN_QUOTE_PACKET_FORMAT)
+
 
 class DataIntegrityError(ValueError):
     """Raised when market data cannot be trusted for PSY29 decisions."""
+
 
 def _finite_positive(value: object) -> float:
     try:
@@ -24,6 +28,7 @@ def _finite_positive(value: object) -> float:
         raise DataIntegrityError("non-finite/out-of-range equity price")
     return number
 
+
 def _normalize_epoch_seconds(value: object) -> int:
     try:
         raw = int(value)
@@ -32,10 +37,45 @@ def _normalize_epoch_seconds(value: object) -> int:
     if raw <= 0:
         raise DataIntegrityError("invalid tick timestamp")
     magnitude = abs(raw)
-    if magnitude >= 10**18: raw //= 10**9
-    elif magnitude >= 10**15: raw //= 10**6
-    elif magnitude >= 10**12: raw //= 10**3
+    if magnitude >= 10**18:
+        raw //= 10**9
+    elif magnitude >= 10**15:
+        raw //= 10**6
+    elif magnitude >= 10**12:
+        raw //= 10**3
     return raw
+
+
+def parse_dhan_quote_packet(data: bytes):
+    """Parse one DhanHQ v2 NSE_EQ Quote packet using the official wire layout.
+
+    The response header occupies bytes 0-7 (zero-based). The first payload
+    field, LTP, therefore starts at byte 8. The official DhanHQ Python client
+    uses the same ``<BHBIfHIfIIIffff`` layout and a 50-byte quote packet.
+    """
+    if not isinstance(data, (bytes, bytearray, memoryview)):
+        return None
+    if len(data) < DHAN_QUOTE_PACKET_SIZE:
+        return None
+    try:
+        code, message_length, exchange_segment, security_id, ltp, ltq, ltt, atp, volume, total_sell, total_buy, day_open, day_close, day_high, day_low = struct.unpack(
+            DHAN_QUOTE_PACKET_FORMAT, bytes(data[:DHAN_QUOTE_PACKET_SIZE])
+        )
+    except struct.error:
+        return None
+    if code != 4 or exchange_segment != 1:
+        return None
+    if message_length < DHAN_QUOTE_PACKET_SIZE or message_length > len(data):
+        return None
+    prices = (ltp, atp, day_open, day_close, day_high, day_low)
+    if not all(math.isfinite(value) for value in prices):
+        return None
+    if ltp <= 0 or day_open <= 0 or day_high <= 0 or day_low <= 0 or atp < 0:
+        return None
+    if volume <= 0 or ltq < 0 or total_sell < 0 or total_buy < 0:
+        return None
+    return security_id, ltp, volume, ltt, day_open, day_high, day_low
+
 
 def validate_ohlcv_row(row: dict, trading_date: str, *, session_only: bool = True, allow_zero_volume: bool = False) -> dict:
     try:
@@ -53,6 +93,7 @@ def validate_ohlcv_row(row: dict, trading_date: str, *, session_only: bool = Tru
     if high < max(opn, close) or low > min(opn, close) or high < low: raise DataIntegrityError("invalid OHLC bounds")
     return dict(row)
 
+
 def validate_intraday_rows(rows: object, trading_date: str) -> list[dict]:
     if not isinstance(rows, list) or not rows: raise DataIntegrityError("empty intraday history")
     valid=[]; previous_epoch=None
@@ -67,6 +108,7 @@ def validate_intraday_rows(rows: object, trading_date: str) -> list[dict]:
     if len(valid)<15: raise DataIntegrityError(f"insufficient valid intraday history: {len(valid)} rows")
     return valid
 
+
 def validate_live_quote(quote: object) -> dict:
     if not isinstance(quote,dict): raise DataIntegrityError("quote is not an object")
     current=_finite_positive(quote.get("current"))
@@ -74,6 +116,7 @@ def validate_live_quote(quote: object) -> dict:
     except (TypeError,ValueError,OverflowError) as exc: raise DataIntegrityError("invalid quote volume") from exc
     if volume<=0: raise DataIntegrityError("zero/negative quote volume")
     return {"current":current,"volume":volume}
+
 
 def validate_quote(quote: object) -> dict:
     if not isinstance(quote,dict): raise DataIntegrityError("quote is not an object")
@@ -87,6 +130,7 @@ def validate_quote(quote: object) -> dict:
     if high<max(opn,current) or low>min(opn,current) or high<low: raise DataIntegrityError("invalid quote OHLC bounds")
     if close is not None and (high<close or low>close): raise DataIntegrityError("invalid quote OHLC bounds")
     return {"current":current,"open":opn,"high":high,"low":low,"close":close,"volume":volume}
+
 
 def _validated_tick(ltp, volume, ltt_epoch, now, previous_volume=None, max_exchange_age_seconds=300):
     price=_finite_positive(ltp)
@@ -106,14 +150,17 @@ def _validated_tick(ltp, volume, ltt_epoch, now, previous_volume=None, max_excha
     if future>5: logging.getLogger("psy29.data_integrity").warning("Accepted exchange-clock skew on live tick: %.1fs",future)
     return price,vol,ltt
 
+
 def validate_live_tick(ltp, volume, ltt_epoch, now, previous_volume=None, *, max_exchange_age_seconds=300):
     return _validated_tick(ltp,volume,ltt_epoch,now,previous_volume,max_exchange_age_seconds)
+
 
 def validate_tick(ltp, volume, ltt_epoch, day_open, day_high, day_low, now, previous_volume=None):
     price,vol,ltt=_validated_tick(ltp,volume,ltt_epoch,now,previous_volume)
     opn=_finite_positive(day_open); high=_finite_positive(day_high); low=_finite_positive(day_low)
     if high<low or high<opn or low>opn or not low<=price<=high: raise DataIntegrityError("invalid live tick market values")
     return price,vol,ltt,opn,high,low
+
 
 def _install_quote_boundary_diagnostics():
     main=sys.modules.get("main")
@@ -133,36 +180,17 @@ def _install_quote_boundary_diagnostics():
         return response
     main.dhan_post=diagnostic_dhan_post; main._psy29_quote_diag_installed=True
 
+
 def _install_canonical_ws_parser():
     main=sys.modules.get("main")
     if main is None: return
-    def parse_quote_packet(data:bytes):
-        # DhanHQ v2 Quote packet: 8-byte header, then fields at byte offsets 9, 13, 15, 19, 23, 27, 31, 35, 39, 43, 47.
-        # The offsets are documented by DhanHQ; the previous hardening parser was one byte early after the header.
-        if len(data)<51 or data[0]!=4: return None
-        security_id=struct.unpack_from("<I",data,4)[0]
-        ltp=struct.unpack_from("<f",data,9)[0]
-        ltq=struct.unpack_from("<h",data,13)[0]
-        ltt=struct.unpack_from("<i",data,15)[0]
-        atp=struct.unpack_from("<f",data,19)[0]
-        volume=struct.unpack_from("<i",data,23)[0]
-        total_sell=struct.unpack_from("<i",data,27)[0]
-        total_buy=struct.unpack_from("<i",data,31)[0]
-        day_open=struct.unpack_from("<f",data,35)[0]
-        day_close=struct.unpack_from("<f",data,39)[0]
-        day_high=struct.unpack_from("<f",data,43)[0]
-        day_low=struct.unpack_from("<f",data,47)[0]
-        values=(ltp,atp,day_open,day_close,day_high,day_low)
-        if not all(math.isfinite(v) for v in values) or any(v<=0 for v in (ltp,day_open,day_high,day_low)) or atp<0 or volume<=0 or ltq<0 or total_sell<0 or total_buy<0: return None
-        return security_id,ltp,volume,ltt,day_open,day_high,day_low
-    main.parse_quote_packet=parse_quote_packet; main._psy29_ws_parser_canonical=True
-    # runner.py historically reassigns main.parse_quote_packet after this module imports.
-    # Guard the websocket boundary so the canonical Dhan parser is always used at runtime.
+    main.parse_quote_packet = parse_dhan_quote_packet
+    main._psy29_ws_parser_canonical=True
     if hasattr(main,"websocket_loop") and not getattr(main,"_psy29_ws_loop_guard_installed",False):
         original_loop=main.websocket_loop
         async def guarded_websocket_loop(token):
             previous_parser=getattr(main,"parse_quote_packet",None)
-            main.parse_quote_packet=parse_quote_packet
+            main.parse_quote_packet=parse_dhan_quote_packet
             try:
                 return await original_loop(token)
             finally:
@@ -170,5 +198,6 @@ def _install_canonical_ws_parser():
                     main.parse_quote_packet=previous_parser
         main.websocket_loop=guarded_websocket_loop
         main._psy29_ws_loop_guard_installed=True
+
 
 _install_quote_boundary_diagnostics(); _install_canonical_ws_parser()
