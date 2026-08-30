@@ -73,6 +73,7 @@ class NormalizedMarketResponse(BaseModel):
     stocks_loaded: int = Field(ge=0)
     stocks: dict[str, NormalizedStock]
     diagnostic: DiagnosticModel = Field(default_factory=lambda: DiagnosticModel(status="OK"))
+    candle_policy: dict[str, Any] | None = None
 
 
 def _clean(value: Any) -> Any:
