@@ -3,10 +3,9 @@ from __future__ import annotations
 import asyncio
 import json
 import math
-import struct
 import threading
 import time
-from datetime import datetime, timedelta, time as dtime
+from datetime import datetime, time as dtime
 
 import main
 from fastapi.responses import JSONResponse, Response
@@ -14,17 +13,15 @@ from psy29.data_integrity import DataIntegrityError, parse_dhan_quote_packet, va
 from psy29.intraday_store import IntradayStore
 from psy29.session_reset import reset_for_trading_date
 
-# PSY29 canonical session rules: NSE cash market 09:15-15:30 IST.
-# main.py still contains the old 15:15 boundary, so the production runner
-# explicitly overrides that shared constant before any session loop starts.
+# Canonical NSE cash session: 09:15-15:30 IST.
+# main.py still has the retired 15:15 boundary, so the production runner owns
+# the actual session boundary used by every live loop.
 main.MARKET_OPEN = (9, 15)
 main.MARKET_CLOSE = (15, 30)
 
-# This runner deliberately does NOT use WebSocket ticks to manufacture 1m candles.
-# Dhan REST intraday 1m OHLCV is the sole canonical candle source.
+# WebSocket is LTP/volume only. It is forbidden from creating or mutating candles.
+# 1m candles come only from Dhan V2 /charts/intraday after the minute has closed.
 CANDLE_SOURCE = "DHAN_V2_REST_INTRADAY_1M_COMPLETED"
-CANDLE_START = dtime(9, 15)
-CANDLE_CLOSE = dtime(15, 30)
 FIRST_COMPLETED_MINUTE = 9 * 60 + 16
 CANDLE_FETCH_DELAY_SECONDS = 2.0
 CANDLE_RETRY_SECONDS = 2.0
@@ -41,7 +38,7 @@ def _snapshot():
         return main.state.get("trading_date"), {k: main.clean_stock(v) for k, v in main.state.get("stocks", {}).items()}
 
 
-def _checkpoint(force=False):
+def _checkpoint():
     trading_date, stocks = _snapshot()
     if not trading_date or not stocks:
         return 0
@@ -65,17 +62,10 @@ def _checkpoint_worker():
             time.sleep(CHECKPOINT_SECONDS)
 
 
-def _parse_live_packet(data: bytes):
-    parsed = parse_dhan_quote_packet(data)
-    if parsed is None:
-        return None
-    return parsed
-
-
 def _seed_state(token: str, security_map: dict[str, str]):
     now = main.now_ist()
     client_id = main.os.environ["DHAN_CLIENT_ID"]
-    raw_quotes = main._original_fetch_market_quote(token, client_id, security_map)
+    raw_quotes = main.fetch_market_quote(token, client_id, security_map)
 
     with main.lock:
         main.state["trading_date"] = now.date().isoformat()
@@ -85,10 +75,10 @@ def _seed_state(token: str, security_map: dict[str, str]):
 
     failures = []
     for symbol in main.STOCKS:
+        q = raw_quotes.get(symbol) or {}
         try:
-            q = raw_quotes.get(symbol)
             live = validate_live_quote(q)
-            prev = main._original_fetch_previous_day(token, security_map[symbol], now)
+            prev = main.fetch_previous_day(token, security_map[symbol], now)
             if not isinstance(prev, dict) or any(prev.get(k) is None for k in ("high", "low", "close")):
                 raise DataIntegrityError("missing previous-day OHLC")
             prev = {k: float(prev[k]) for k in ("high", "low", "close")}
@@ -99,9 +89,10 @@ def _seed_state(token: str, security_map: dict[str, str]):
         except Exception as exc:
             failures.append(symbol)
             main.log.warning("Seed validation failed for %s: %s", symbol, exc)
-            q = raw_quotes.get(symbol) or {}
-            live = {"current": float(q.get("current")) if q.get("current") is not None else None,
-                    "volume": int(q.get("volume") or 0)}
+            try:
+                live = {"current": float(q.get("current")), "volume": int(q.get("volume") or 0)}
+            except Exception:
+                live = {"current": None, "volume": 0}
             prev = {"high": None, "low": None, "close": None}
 
         with main.lock:
@@ -133,15 +124,14 @@ def _seed_state(token: str, security_map: dict[str, str]):
             }
 
     main.log.info("Seeded %d/%d live stocks", len(main.STOCKS) - len(failures), len(main.STOCKS))
-    return failures
 
 
 def _completed_rows(rows: list[dict], trading_date: str, cutoff_epoch: int) -> list[dict]:
-    """Validate Dhan 1m rows and keep only completed real candles.
+    """Validate Dhan 1m rows and keep only already-completed real candles.
 
-    No minimum-row requirement is imposed here: at 09:16 there is exactly one
-    possible completed regular-session candle. Missing minutes remain missing;
-    the engine never fills them with synthetic OHLCV.
+    There is intentionally no minimum-row requirement. At 09:16 the only
+    valid completed regular-session candle is the 09:15 candle. If Dhan has no
+    real candle for a minute, the minute remains absent; no OHLCV is invented.
     """
     if not isinstance(rows, list):
         raise DataIntegrityError("intraday response is not a list")
@@ -167,7 +157,7 @@ def _live_metadata(symbol: str):
         return s.get("current_price"), s.get("volume"), s.get("last_tick"), s.get("previous_day")
 
 
-def _install_canonical_candles(symbol: str, rows: list[dict], quote_current, quote_volume, prev):
+def _install_canonical_candles(symbol: str, rows: list[dict], current_price, volume, prev):
     if not rows:
         return False
     session_ohlc = {
@@ -176,34 +166,27 @@ def _install_canonical_candles(symbol: str, rows: list[dict], quote_current, quo
         "low": min(r["low"] for r in rows),
         "close": rows[-1]["close"],
     }
+    if current_price is None:
+        current_price = rows[-1]["close"]
+    # rebuild_stock derives 5m/15m/1h only from these canonical 1m rows.
     quote = {
-        "current": quote_current,
+        "current": current_price,
         "open": session_ohlc["open"],
         "high": session_ohlc["high"],
         "low": session_ohlc["low"],
         "close": session_ohlc["close"],
-        "volume": quote_volume,
+        "volume": volume,
     }
-    if quote_current is None:
-        quote["current"] = rows[-1]["close"]
-    try:
-        validate_live_quote({"current": quote["current"], "volume": int(quote.get("volume") or 0)})
-    except DataIntegrityError:
-        quote["volume"] = max(1, int(quote.get("volume") or 0))
-
-    # main.rebuild_stock derives 5m/15m/1h only from these real 1m rows.
     main.rebuild_stock(symbol, rows, quote, prev or {"high": None, "low": None, "close": None})
     with main.lock:
         stock = main.state["stocks"].get(symbol)
         if not stock:
             return False
-        last_tick = stock.get("last_tick")
         stock["ohlc"] = session_ohlc
         stock["session_high"] = session_ohlc["high"]
         stock["session_low"] = session_ohlc["low"]
-        stock["current_price"] = quote["current"]
-        stock["volume"] = quote["volume"]
-        stock["last_tick"] = last_tick
+        stock["current_price"] = current_price
+        stock["volume"] = volume
         stock["data_source_status"] = "LIVE"
         stock["candle_source"] = CANDLE_SOURCE
         stock["completed_candle_count"] = len(rows)
@@ -219,7 +202,7 @@ def _refresh_symbol_completed(token: str, symbol: str, security_id: str, target_
     now = main.now_ist()
     from_dt = now.replace(hour=9, minute=15, second=0, microsecond=0)
     to_dt = datetime.fromtimestamp(target_epoch + 60, main.IST)
-    rows = main._original_fetch_intraday_1m(token, security_id, from_dt, to_dt)
+    rows = main.fetch_intraday_1m(token, security_id, from_dt, to_dt)
     completed = _completed_rows(rows, now.date().isoformat(), target_epoch)
     current, volume, last_tick, prev = _live_metadata(symbol)
     if not completed:
@@ -229,8 +212,6 @@ def _refresh_symbol_completed(token: str, symbol: str, security_id: str, target_
 
 
 def _canonical_minute_worker(token: str, security_map: dict[str, str]):
-    # Never create a candle at 09:15. The first possible completed candle is
-    # the 09:15-09:15:59 candle, published/accepted at the 09:16 boundary.
     last_target = None
     while main.in_session(main.now_ist()):
         now = main.now_ist()
@@ -244,7 +225,7 @@ def _canonical_minute_worker(token: str, security_map: dict[str, str]):
             time.sleep(0.25)
             continue
 
-        # Give the broker a short publication window after the minute closes.
+        # Give Dhan a short publication window after the minute closes.
         target_boundary = datetime.fromtimestamp(target_epoch + 60, main.IST)
         delay = (target_boundary - now).total_seconds() + CANDLE_FETCH_DELAY_SECONDS
         if delay > 0:
@@ -268,11 +249,11 @@ def _canonical_minute_worker(token: str, security_map: dict[str, str]):
         else:
             main.log.info("Canonical 1m minute committed: %s | %d/%d stocks", datetime.fromtimestamp(target_epoch, main.IST).strftime("%H:%M"), len(main.STOCKS), len(main.STOCKS))
         last_target = target_epoch
-        _checkpoint(force=True)
+        _checkpoint()
 
 
 def _websocket_live_loop(token: str):
-    """WebSocket is LTP/volume only. It is forbidden from mutating candle arrays."""
+    """Dhan WebSocket updates live price/volume only; it never creates candles."""
     client_id = main.os.environ["DHAN_CLIENT_ID"]
     reverse = {int(v): k for k, v in main.state["security_map"].items()}
     url = f"{main.WS_URL}?version=2&token={token}&clientId={client_id}&authType=2"
@@ -296,7 +277,7 @@ def _websocket_live_loop(token: str):
                             continue
                         if message[0] == 50:
                             raise RuntimeError("Dhan websocket disconnect packet")
-                        parsed = _parse_live_packet(message)
+                        parsed = parse_dhan_quote_packet(message)
                         if not parsed:
                             continue
                         sid, ltp, volume, ltt, *_ = parsed
@@ -329,7 +310,7 @@ def _websocket_live_loop(token: str):
                             stock["data_source_status"] = "LIVE"
                             if ltt_iso:
                                 stock["last_tick"] = ltt_iso
-                            # Deliberately do not touch _one_min/candles here.
+                            # IMPORTANT: no _one_min/candles mutation here.
                             main.state["last_update"] = now.isoformat()
                         if bad_ltt and bad_ltt % 100 == 1:
                             main.log.warning("Dhan LTT rejected for candle timing %d times; live price retained, no synthetic candle fallback", bad_ltt)
@@ -366,7 +347,7 @@ def _supervisor():
             _seed_state(token, security_map)
             threading.Thread(target=_canonical_minute_worker, args=(token, security_map), daemon=True, name="psy29-canonical-1m").start()
             _websocket_live_loop(token)
-            _checkpoint(force=True)
+            _checkpoint()
             with main.lock:
                 main.state["source_status"] = "POST_CLOSE" if not main.in_session(main.now_ist()) else "RECONNECTING"
             if main.in_session(main.now_ist()):
@@ -396,16 +377,12 @@ def _machine_payload():
             "data_source_status": main.state["source_status"],
             "stocks_expected": len(main.STOCKS),
             "stocks": {k: main.clean_stock(v) for k, v in main.state["stocks"].items()},
-            "candle_policy": {
-                "source": CANDLE_SOURCE,
-                "first_completed_minute": "09:16",
-                "regular_session": "09:15-15:30 IST",
-                "synthetic_candles": False,
-            },
+            "candle_policy": {"source": CANDLE_SOURCE, "first_completed_minute": "09:16", "regular_session": "09:15-15:30 IST", "synthetic_candles": False},
         }
 
     unsafe = []
-    completed_cutoff = int(now.replace(second=0, microsecond=0).timestamp()) - 60 if main.in_session(now) else None
+    in_regular_session = main.in_session(now)
+    completed_cutoff = int(now.replace(second=0, microsecond=0).timestamp()) - 60 if in_regular_session else None
     for symbol, stock in raw["stocks"].items():
         try:
             if stock.get("trading_date") != trading_date:
@@ -421,7 +398,7 @@ def _machine_payload():
                     raise DataIntegrityError("1m candle order invalid")
                 previous = epoch
             if not one_min:
-                if main.in_session(now) and (now.hour * 60 + now.minute) >= FIRST_COMPLETED_MINUTE:
+                if in_regular_session and (now.hour * 60 + now.minute) >= FIRST_COMPLETED_MINUTE:
                     raise DataIntegrityError("1m candle history missing after first completed minute")
                 continue
 
@@ -432,8 +409,7 @@ def _machine_payload():
                     raise DataIntegrityError(f"session OHLC {key} does not match canonical 1m candles")
             if stock.get("session_high") != expected["high"] or stock.get("session_low") != expected["low"]:
                 raise DataIntegrityError("session range does not match canonical 1m candles")
-
-            live = validate_live_quote({"current": stock.get("current_price"), "volume": stock.get("volume")})
+            validate_live_quote({"current": stock.get("current_price"), "volume": stock.get("volume")})
             for key, expected_value in (("vwap", main.calc_vwap(one_min)), ("ema9", main.calc_ema(one_min, 9)), ("ema20", main.calc_ema(one_min, 20))):
                 supplied_value = stock.get(key)
                 if expected_value is None or supplied_value is None or not math.isfinite(float(supplied_value)) or abs(float(supplied_value) - float(expected_value)) > max(0.01, abs(float(expected_value)) * 0.0001):
@@ -452,20 +428,11 @@ def _machine_payload():
 
 
 def _headers(refresh_id: str):
-    return {
-        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0, s-maxage=0",
-        "Pragma": "no-cache",
-        "Expires": "0",
-        "Surrogate-Control": "no-store",
-        "Vary": "*",
-        "Access-Control-Allow-Origin": "*",
-        "X-Content-Type-Options": "nosniff",
-        "X-PSY29-Refresh-ID": refresh_id,
-    }
+    return {"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0, s-maxage=0", "Pragma": "no-cache", "Expires": "0", "Surrogate-Control": "no-store", "Vary": "*", "Access-Control-Allow-Origin": "*", "X-Content-Type-Options": "nosniff", "X-PSY29-Refresh-ID": refresh_id}
 
 
 def _json_response():
-    refresh_id = f"{time.time_ns()}"
+    refresh_id = str(time.time_ns())
     return JSONResponse(content=_machine_payload(), headers=_headers(refresh_id))
 
 
@@ -486,7 +453,7 @@ def data_json():
 
 @main.app.get("/data.txt")
 def data_txt():
-    refresh_id = f"{time.time_ns()}"
+    refresh_id = str(time.time_ns())
     body = json.dumps(_machine_payload(), separators=(",", ":"), ensure_ascii=False)
     return Response(content=body, media_type="text/plain", headers=_headers(refresh_id))
 
