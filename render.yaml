@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: psy29-live-data
+    name: psy29-live-data-hardening
     runtime: python
     plan: free
     region: singapore
