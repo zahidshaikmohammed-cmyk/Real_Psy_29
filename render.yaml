@@ -5,6 +5,6 @@ services:
     plan: free
     region: singapore
     buildCommand: pip install -r requirements.txt
-    startCommand: python runner.py
+    startCommand: python runner_live.py
     autoDeploy: true
     healthCheckPath: /health
