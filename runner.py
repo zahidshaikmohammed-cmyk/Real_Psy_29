@@ -1,14 +1,6 @@
 from __future__ import annotations
-
-import asyncio
-import json
-import math
-import os
-import struct
-import threading
-import time
+import asyncio, json, math, os, struct, threading, time
 from datetime import datetime
-
 import main
 from fastapi import Response
 from fastapi.responses import JSONResponse
@@ -16,638 +8,243 @@ from psy29.data_integrity import DataIntegrityError
 from psy29.intraday_store import IntradayStore
 from psy29.session_reset import reset_for_trading_date
 
-# Layer-1 live-data contract: NSE cash session through 15:15 IST.
-main.MARKET_OPEN = (9, 15)
-main.MARKET_CLOSE = (15, 15)
-CANDLE_SOURCE = "DHAN_WEBSOCKET_REAL_TICKS_1M"
-HISTORICAL_CANDLE_SOURCE = "DHAN_INTRADAY_1M"
-AUTH_COOLDOWN_SECONDS = 125
-CHECKPOINT_SECONDS = 60
-QUOTE_REFRESH_SECONDS = 1.2
-CANDLE_RECONCILE_SECONDS = 20
-MAX_TICK_AGE_SECONDS = 300
-QUOTE_FORMAT = "<BHBIfHIfIIIffff"
-QUOTE_SIZE = struct.calcsize(QUOTE_FORMAT)
+main.MARKET_OPEN=(9,15); main.MARKET_CLOSE=(15,15)
 
-main.app.router.on_startup.clear()
-store = IntradayStore()
+# Dhan chart endpoints are authenticated with both the access token and client id.
+def _fetch_intraday(token, security_id, from_dt, to_dt):
+    payload={"securityId":str(security_id),"exchangeSegment":"NSE_EQ","instrument":"EQUITY","interval":"1","oi":False,"fromDate":from_dt.strftime("%Y-%m-%d %H:%M:%S"),"toDate":to_dt.strftime("%Y-%m-%d %H:%M:%S")}
+    r=main.dhan_post(f"{main.DHAN_BASE}/charts/intraday",token=token,client_id=os.environ["DHAN_CLIENT_ID"],payload=payload,kind="data",timeout=25,label=f"intraday:{security_id}")
+    return main.parse_series_response(r.json())
 
+def _fetch_previous(token, security_id, today):
+    start=(today - __import__('datetime').timedelta(days=10)).date().isoformat(); end=today.date().isoformat()
+    payload={"securityId":str(security_id),"exchangeSegment":"NSE_EQ","instrument":"EQUITY","expiryCode":0,"oi":False,"fromDate":start,"toDate":end}
+    r=main.dhan_post(f"{main.DHAN_BASE}/charts/historical",token=token,client_id=os.environ["DHAN_CLIENT_ID"],payload=payload,kind="data",timeout=25,label=f"historical:{security_id}")
+    rows=main.parse_series_response(r.json())
+    if not rows:return {"high":None,"low":None,"close":None}
+    x=rows[-1]; return {"high":x["high"],"low":x["low"],"close":x["close"]}
 
-def _headers(refresh_id: str):
-    return {
-        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0, s-maxage=0",
-        "Pragma": "no-cache",
-        "Expires": "0",
-        "Surrogate-Control": "no-store",
-        "Vary": "*",
-        "Access-Control-Allow-Origin": "*",
-        "X-Content-Type-Options": "nosniff",
-        "X-PSY29-Refresh-ID": refresh_id,
-    }
+main.fetch_intraday_1m=_fetch_intraday
+main.fetch_previous_day=_fetch_previous
+CANDLE_SOURCE='DHAN_WEBSOCKET_REAL_TICKS_1M'; HISTORICAL_CANDLE_SOURCE='DHAN_INTRADAY_1M'
+CHECKPOINT_SECONDS=60; CANDLE_RECONCILE_SECONDS=20; QUOTE_REFRESH_SECONDS=2
+MAX_TICK_AGE_SECONDS=300; FUTURE_TICK_TOLERANCE_SECONDS=120
+QUOTE_FORMAT='<BHBIfHIfIIIffff'; QUOTE_SIZE=struct.calcsize(QUOTE_FORMAT)
+main.app.router.on_startup.clear(); store=IntradayStore()
 
+def headers(rid): return {'Cache-Control':'no-store, no-cache, must-revalidate, max-age=0, s-maxage=0','Pragma':'no-cache','Expires':'0','Surrogate-Control':'no-store','Vary':'*','Access-Control-Allow-Origin':'*','X-Content-Type-Options':'nosniff','X-PSY29-Refresh-ID':rid}
 
-def _normalize_epoch(value: int) -> int:
-    value = int(value)
-    magnitude = abs(value)
-    if magnitude >= 10**18:
-        value //= 10**9
-    elif magnitude >= 10**15:
-        value //= 10**6
-    elif magnitude >= 10**12:
-        value //= 10**3
-    return value
+def norm_epoch(v):
+    v=int(v); m=abs(v)
+    if m>=10**18:v//=10**9
+    elif m>=10**15:v//=10**6
+    elif m>=10**12:v//=10**3
+    return v
 
+def parse_packets(message):
+    if not isinstance(message,(bytes,bytearray,memoryview)): return
+    buf=bytes(message); off=0
+    while off+QUOTE_SIZE<=len(buf):
+        try: code=int(buf[off]); declared=int.from_bytes(buf[off+1:off+3],'little')
+        except Exception: break
+        if declared!=QUOTE_SIZE or off+declared>len(buf): break
+        packet=buf[off:off+QUOTE_SIZE]
+        try: code,msglen,segment,sid,ltp,ltq,ltt,atp,volume,sell,buy,op,cl,hi,lo=struct.unpack(QUOTE_FORMAT,packet)
+        except struct.error: break
+        if code==4 and segment==1:
+            yield {'security_id':int(sid),'ltp':float(ltp),'ltq':int(ltq),'ltt':norm_epoch(ltt),'volume':int(volume),'open':float(op),'high':float(hi),'low':float(lo)}
+        off+=declared
 
-def _parse_quote_packets(message: bytes):
-    """Parse Dhan v2 Quote packets using the documented binary layout."""
-    if not isinstance(message, (bytes, bytearray, memoryview)):
-        return
-    buf = bytes(message)
-    if len(buf) < QUOTE_SIZE:
-        return
+def valid_tick(tick,now):
+    p=float(tick['ltp']); v=int(tick['volume']); q=max(0,int(tick['ltq']))
+    if not math.isfinite(p) or p<=0 or p>10_000_000: raise DataIntegrityError('non-finite/out-of-range equity price')
+    if v<0: raise DataIntegrityError('invalid cumulative volume')
+    dt=datetime.fromtimestamp(int(tick['ltt']),main.IST)
+    if dt.date()!=now.date(): raise DataIntegrityError('tick timestamp outside trading date')
+    if not main.MARKET_OPEN <= (dt.hour,dt.minute) < main.MARKET_CLOSE: raise DataIntegrityError('tick timestamp outside NSE session')
+    age=(now-dt).total_seconds()
+    if age < -FUTURE_TICK_TOLERANCE_SECONDS: raise DataIntegrityError('future live tick')
+    if age > MAX_TICK_AGE_SECONDS: raise DataIntegrityError('stale live tick')
+    return p,v,q,dt
 
-    offset = 0
-    while offset + QUOTE_SIZE <= len(buf):
-        # Dhan's official Python client parses the first quote packet directly
-        # from byte zero. Do the same; only use declared lengths for subsequent
-        # concatenated packets so a malformed length cannot shift the parser.
-        if offset == 0:
-            packet = buf[:QUOTE_SIZE]
-        else:
-            if offset + 3 > len(buf):
-                break
-            declared = int.from_bytes(buf[offset + 1:offset + 3], "little", signed=False)
-            if declared != QUOTE_SIZE or offset + declared > len(buf):
-                break
-            packet = buf[offset:offset + QUOTE_SIZE]
-
-        try:
-            code, msglen, segment, sid, ltp, ltq, ltt, atp, volume, sell, buy, day_open, day_close, day_high, day_low = struct.unpack(
-                QUOTE_FORMAT, packet
-            )
-        except struct.error:
-            break
-
-        if code == 4 and segment == 1 and msglen >= QUOTE_SIZE:
-            yield {
-                "security_id": int(sid),
-                "ltp": float(ltp),
-                "ltq": int(ltq),
-                "ltt": _normalize_epoch(ltt),
-                "volume": int(volume),
-                "open": float(day_open),
-                "high": float(day_high),
-                "low": float(day_low),
-            }
-
-        if offset == 0:
-            declared = int.from_bytes(buf[1:3], "little", signed=False)
-            if declared != QUOTE_SIZE:
-                break
-            offset = QUOTE_SIZE
-        else:
-            offset += QUOTE_SIZE
-
-
-def _finite_price(value):
-    value = float(value)
-    if not math.isfinite(value) or value <= 0 or value > 10_000_000:
-        raise DataIntegrityError("non-finite/out-of-range equity price")
-    return value
-
-
-def _valid_tick(tick: dict, now):
-    price = _finite_price(tick["ltp"])
-    volume = int(tick["volume"])
-    ltq = max(0, int(tick["ltq"]))
-    if volume < 0:
-        raise DataIntegrityError("invalid cumulative volume")
-
-    epoch = int(tick["ltt"])
-    try:
-        dt = datetime.fromtimestamp(epoch, main.IST)
-    except (OverflowError, OSError, ValueError) as exc:
-        raise DataIntegrityError("invalid live tick timestamp") from exc
-
-    if dt.date() != now.date():
-        raise DataIntegrityError("tick timestamp outside trading date")
-    if not main.MARKET_OPEN <= (dt.hour, dt.minute) < main.MARKET_CLOSE:
-        raise DataIntegrityError("tick timestamp outside NSE session")
-    age = (now - dt).total_seconds()
-    if age < -60:
-        raise DataIntegrityError("future live tick")
-    if age > MAX_TICK_AGE_SECONDS:
-        raise DataIntegrityError("stale live tick")
-    return price, volume, ltq, dt
-
-
-def _seed_state(token: str, security_map: dict[str, str]):
-    now = main.now_ist()
-    client_id = os.environ["DHAN_CLIENT_ID"]
-    quotes = main.fetch_market_quote(token, client_id, security_map)
-
-    with main.lock:
-        main.state["trading_date"] = now.date().isoformat()
-        main.state["market_session_status"] = "OPEN"
-        main.state["security_map"] = security_map
-        main.state["stocks"] = {}
-        main.state["source_status"] = "CONNECTING"
-
+def seed(token,security_map):
+    now=main.now_ist(); client_id=os.environ['DHAN_CLIENT_ID']
+    try: quotes=main.fetch_market_quote(token,client_id,security_map)
+    except Exception as exc: main.log.warning('Initial market quote snapshot unavailable: %s',exc); quotes={}
+    with main.lock: main.state.update(trading_date=now.date().isoformat(),market_session_status='OPEN',security_map=security_map,stocks={},source_status='CONNECTING')
     for symbol in main.STOCKS:
-        q = quotes.get(symbol) or {}
-        try:
-            prev = main.fetch_previous_day(token, security_map[symbol], now)
-            if not isinstance(prev, dict):
-                prev = {"high": None, "low": None, "close": None}
-        except Exception as exc:
-            main.log.warning("Previous-day reference unavailable for %s: %s", symbol, exc)
-            prev = {"high": None, "low": None, "close": None}
-
+        q=quotes.get(symbol) or {}
+        try: prev=main.fetch_previous_day(token,security_map[symbol],now)
+        except Exception as exc: main.log.warning('Previous-day reference unavailable for %s: %s',symbol,exc); prev={'high':None,'low':None,'close':None}
         with main.lock:
-            main.state["stocks"][symbol] = {
-                "symbol": symbol,
-                "security_id": security_map[symbol],
-                "current_price": q.get("current"),
-                "ohlc": {
-                    "open": q.get("open"),
-                    "high": q.get("high"),
-                    "low": q.get("low"),
-                    "close": q.get("current"),
-                },
-                "session_high": q.get("high"),
-                "session_low": q.get("low"),
-                "previous_day": prev,
-                "volume": q.get("volume"),
-                "candles": {"1m": [], "5m": [], "15m": [], "1h": []},
-                "vwap": None,
-                "ema9": None,
-                "ema20": None,
-                "opening_range": {"period": "09:15-09:30", "status": "NOT_FORMED", "high": None, "low": None},
-                "structure": {"trend": "INSUFFICIENT_DATA", "swing_high": None, "swing_low": None},
-                "timestamp": now.isoformat(),
-                "trading_date": now.date().isoformat(),
-                "market_session_status": "OPEN",
-                "data_source_status": "LIVE",
-                "last_tick": None,
-                "completed_candle_count": 0,
-                "last_completed_candle": None,
-                "candle_source": CANDLE_SOURCE,
-                "_one_min": [],
-                "_builder": None,
-            }
-    main.log.info("Seeded live state: %d/%d stocks", len(main.state["stocks"]), len(main.STOCKS))
+            main.state['stocks'][symbol]={'symbol':symbol,'security_id':security_map[symbol],'current_price':q.get('current'),'ohlc':{'open':q.get('open'),'high':q.get('high'),'low':q.get('low'),'close':q.get('current')},'session_high':q.get('high'),'session_low':q.get('low'),'previous_day':prev,'volume':q.get('volume'),'candles':{'1m':[],'5m':[],'15m':[],'1h':[]},'vwap':None,'ema9':None,'ema20':None,'opening_range':{'period':'09:15-09:30','status':'NOT_FORMED','high':None,'low':None},'structure':{'trend':'INSUFFICIENT_DATA','swing_high':None,'swing_low':None},'timestamp':now.isoformat(),'trading_date':now.date().isoformat(),'market_session_status':'OPEN','data_source_status':'LIVE','last_tick':None,'completed_candle_count':0,'last_completed_candle':None,'candle_source':CANDLE_SOURCE,'_one_min':[],'_builder':None}
+    main.log.info('Seeded live state: %d/%d stocks',len(main.state['stocks']),len(main.STOCKS))
 
-
-def _commit_bar(symbol: str, bar: dict):
-    if not bar:
-        return
+def commit_bar(symbol,bar):
+    if not bar:return
     with main.lock:
-        stock = main.state["stocks"].get(symbol)
-        if not stock:
-            return
-        rows = list(stock.get("_one_min", []))
-
-    if rows and int(rows[-1]["epoch"]) == int(bar["epoch"]):
-        return
-
-    rows.append(dict(bar))
-    rows.sort(key=lambda x: int(x["epoch"]))
-
+        s=main.state['stocks'].get(symbol)
+        if not s:return
+        rows=list(s.get('_one_min',[]))
+    if rows and int(rows[-1]['epoch'])==int(bar['epoch']):return
+    rows.append(dict(bar)); rows.sort(key=lambda x:int(x['epoch']))
     with main.lock:
-        stock = main.state["stocks"].get(symbol)
-        if not stock:
-            return
-        quote = {
-            "current": stock.get("current_price"),
-            "open": stock.get("ohlc", {}).get("open") or rows[0]["open"],
-            "high": stock.get("ohlc", {}).get("high") or max(r["high"] for r in rows),
-            "low": stock.get("ohlc", {}).get("low") or min(r["low"] for r in rows),
-            "close": stock.get("current_price") or rows[-1]["close"],
-            "volume": stock.get("volume"),
-        }
-        prev = stock.get("previous_day") or {"high": None, "low": None, "close": None}
-        last_tick = stock.get("last_tick")
-        builder = stock.get("_builder")
-
-    main.rebuild_stock(symbol, rows, quote, prev)
-
+        s=main.state['stocks'].get(symbol)
+        if not s:return
+        quote={'current':s.get('current_price'),'open':s.get('ohlc',{}).get('open') or rows[0]['open'],'high':s.get('ohlc',{}).get('high') or max(r['high'] for r in rows),'low':s.get('ohlc',{}).get('low') or min(r['low'] for r in rows),'close':s.get('current_price') or rows[-1]['close'],'volume':s.get('volume')}
+        prev=s.get('previous_day') or {'high':None,'low':None,'close':None}; last=s.get('last_tick'); builder=s.get('_builder')
+    main.rebuild_stock(symbol,rows,quote,prev)
     with main.lock:
-        stock = main.state["stocks"].get(symbol)
-        if not stock:
-            return
-        stock["candle_source"] = CANDLE_SOURCE
-        stock["completed_candle_count"] = len(rows)
-        stock["last_completed_candle"] = rows[-1]["timestamp"]
-        stock["_one_min"] = rows
-        stock["_builder"] = builder
-        stock["data_source_status"] = "LIVE"
-        stock["last_tick"] = last_tick or bar["timestamp"]
-        main.state["last_update"] = main.now_ist().isoformat()
+        s=main.state['stocks'].get(symbol)
+        if not s:return
+        s['candle_source']=CANDLE_SOURCE; s['completed_candle_count']=len(rows); s['last_completed_candle']=rows[-1]['timestamp']; s['_one_min']=rows; s['_builder']=builder; s['data_source_status']='LIVE'; s['last_tick']=last or bar['timestamp']; main.state['last_update']=main.now_ist().isoformat()
 
-
-def _ingest_tick(symbol: str, tick: dict):
-    now = main.now_ist()
-    price, cumulative_volume, ltq, dt = _valid_tick(tick, now)
-    minute_dt = dt.replace(second=0, microsecond=0)
-    epoch = int(minute_dt.timestamp())
-
+def ingest(symbol,tick):
+    now=main.now_ist(); price,cum,ltq,dt=valid_tick(tick,now); minute=dt.replace(second=0,microsecond=0); epoch=int(minute.timestamp())
     with main.lock:
-        stock = main.state["stocks"].get(symbol)
-        if not stock:
-            return
-        builder = stock.get("_builder")
-        if builder and epoch < int(builder["epoch"]):
-            raise DataIntegrityError("out-of-order live tick")
-        finished = dict(builder) if builder and epoch > int(builder["epoch"]) else None
-
-    if finished:
-        _commit_bar(symbol, finished)
-
+        s=main.state['stocks'].get(symbol)
+        if not s:return
+        b=s.get('_builder')
+        if b and epoch<int(b['epoch']): raise DataIntegrityError('out-of-order live tick')
+        finished=dict(b) if b and epoch>int(b['epoch']) else None
+    if finished and int(finished['epoch']) <= int(now.replace(second=0,microsecond=0).timestamp()): commit_bar(symbol,finished)
     with main.lock:
-        stock = main.state["stocks"].get(symbol)
-        if not stock:
-            return
-        builder = stock.get("_builder")
-        if builder is None or int(builder["epoch"]) != epoch:
-            builder = {
-                "timestamp": minute_dt.isoformat(),
-                "epoch": epoch,
-                "open": price,
-                "high": price,
-                "low": price,
-                "close": price,
-                "volume": 0,
-            }
-            stock["_builder"] = builder
+        s=main.state['stocks'].get(symbol)
+        if not s:return
+        b=s.get('_builder')
+        if b is None or int(b['epoch'])!=epoch: b={'timestamp':minute.isoformat(),'epoch':epoch,'open':price,'high':price,'low':price,'close':price,'volume':0}; s['_builder']=b
+        b['high']=max(float(b['high']),price); b['low']=min(float(b['low']),price); b['close']=price; b['volume']=int(b.get('volume',0))+ltq
+        s['current_price']=price; s['volume']=cum; s['timestamp']=now.isoformat(); s['market_session_status']=main.session_status(now); s['data_source_status']='LIVE'; s['last_tick']=dt.isoformat(); s['ohlc']['close']=price; s['ohlc']['high']=max(s['ohlc'].get('high') or price,price); s['ohlc']['low']=min(s['ohlc'].get('low') or price,price); s['session_high']=s['ohlc']['high']; s['session_low']=s['ohlc']['low']; main.state['last_update']=now.isoformat()
 
-        builder["high"] = max(float(builder["high"]), price)
-        builder["low"] = min(float(builder["low"]), price)
-        builder["close"] = price
-        builder["volume"] = int(builder.get("volume", 0)) + ltq
-        stock["current_price"] = price
-        stock["volume"] = cumulative_volume
-        stock["timestamp"] = now.isoformat()
-        stock["market_session_status"] = main.session_status(now)
-        stock["data_source_status"] = "LIVE"
-        stock["last_tick"] = dt.isoformat()
-        stock["ohlc"]["close"] = price
-        stock["ohlc"]["high"] = max(stock["ohlc"].get("high") or price, price)
-        stock["ohlc"]["low"] = min(stock["ohlc"].get("low") or price, price)
-        stock["session_high"] = stock["ohlc"]["high"]
-        stock["session_low"] = stock["ohlc"]["low"]
-        main.state["last_update"] = now.isoformat()
-
-
-def _finalize_closed_builders():
-    current_epoch = int(main.now_ist().replace(second=0, microsecond=0).timestamp())
+def finalize():
+    cur=int(main.now_ist().replace(second=0,microsecond=0).timestamp())
     for symbol in main.STOCKS:
-        with main.lock:
-            stock = main.state["stocks"].get(symbol)
-            builder = dict(stock.get("_builder")) if stock and stock.get("_builder") else None
-        if builder and int(builder["epoch"]) < current_epoch:
-            _commit_bar(symbol, builder)
+        with main.lock: s=dict(main.state['stocks'].get(symbol,{})); b=dict(s.get('_builder')) if s.get('_builder') else None
+        if b and int(b['epoch'])<cur: commit_bar(symbol,b)
 
-
-def _refresh_quotes_once(token: str):
-    with main.lock:
-        security_map = dict(main.state.get("security_map") or {})
-    if len(security_map) != len(main.STOCKS):
-        return
-
-    client_id = os.environ["DHAN_CLIENT_ID"]
-    quotes = main.fetch_market_quote(token, client_id, security_map)
-    now = main.now_ist()
-    with main.lock:
-        for symbol, q in quotes.items():
-            stock = main.state["stocks"].get(symbol)
-            if not stock:
-                continue
-            if q.get("current") is not None:
-                stock["current_price"] = q["current"]
-                stock["ohlc"]["close"] = q["current"]
-            for key in ("open", "high", "low"):
-                if q.get(key) is not None:
-                    stock["ohlc"][key] = q[key]
-            if q.get("volume") is not None:
-                stock["volume"] = q["volume"]
-            stock["session_high"] = stock["ohlc"].get("high")
-            stock["session_low"] = stock["ohlc"].get("low")
-            stock["timestamp"] = now.isoformat()
-            stock["market_session_status"] = main.session_status(now)
-            stock["data_source_status"] = "LIVE"
-        main.state["last_update"] = now.isoformat()
-
-
-def _reconcile_candles_once(token: str):
-    """Confirm completed 1m candles from Dhan; never fabricate a bar."""
-    now = main.now_ist()
-    current_epoch = int(now.replace(second=0, microsecond=0).timestamp())
-    from_dt = now.replace(hour=9, minute=15, second=0, microsecond=0)
-    with main.lock:
-        security_map = dict(main.state.get("security_map") or {})
-
+def reconcile(token):
+    now=main.now_ist(); cur=int(now.replace(second=0,microsecond=0).timestamp()); start=now.replace(hour=9,minute=15,second=0,microsecond=0)
+    with main.lock: sm=dict(main.state.get('security_map') or {})
     for symbol in main.STOCKS:
-        if not main.in_session(main.now_ist()):
-            break
-        sid = security_map.get(symbol)
-        if not sid:
-            continue
+        if not main.in_session(main.now_ist()):break
+        sid=sm.get(symbol)
+        if not sid:continue
         try:
-            rows = main.fetch_intraday_1m(token, sid, from_dt, now)
-            completed = [r for r in rows if int(r.get("epoch", 0)) < current_epoch]
-            if not completed:
-                continue
-
+            rows=main.fetch_intraday_1m(token,sid,start,now); completed=[r for r in rows if int(r.get('epoch',0))<cur]
+            if not completed:continue
             with main.lock:
-                stock = main.state["stocks"].get(symbol)
-                existing = list(stock.get("_one_min", [])) if stock else []
-                builder = dict(stock.get("_builder")) if stock and stock.get("_builder") else None
-                last_tick = stock.get("last_tick") if stock else None
-                current = stock.get("current_price") if stock else None
-                volume = stock.get("volume") if stock else None
-                prev = stock.get("previous_day") if stock else {"high": None, "low": None, "close": None}
-
-            merged = {int(r["epoch"]): r for r in existing}
-            for r in completed:
-                merged[int(r["epoch"])] = r
-            merged_rows = [merged[k] for k in sorted(merged)]
-            quote = {
-                "current": current or merged_rows[-1]["close"],
-                "open": merged_rows[0]["open"],
-                "high": max(r["high"] for r in merged_rows),
-                "low": min(r["low"] for r in merged_rows),
-                "close": current or merged_rows[-1]["close"],
-                "volume": volume,
-            }
-            main.rebuild_stock(symbol, merged_rows, quote, prev or {"high": None, "low": None, "close": None})
-
+                s=main.state['stocks'].get(symbol); existing=list(s.get('_one_min',[])) if s else []; builder=dict(s.get('_builder')) if s and s.get('_builder') else None; last=s.get('last_tick') if s else None; current=s.get('current_price') if s else None; volume=s.get('volume') if s else None; prev=s.get('previous_day') if s else {'high':None,'low':None,'close':None}
+            merged={int(r['epoch']):r for r in existing}; merged.update({int(r['epoch']):r for r in completed}); merged_rows=[merged[k] for k in sorted(merged)]
+            quote={'current':current or merged_rows[-1]['close'],'open':merged_rows[0]['open'],'high':max(r['high'] for r in merged_rows),'low':min(r['low'] for r in merged_rows),'close':current or merged_rows[-1]['close'],'volume':volume}
+            main.rebuild_stock(symbol,merged_rows,quote,prev or {'high':None,'low':None,'close':None})
             with main.lock:
-                stock = main.state["stocks"].get(symbol)
-                if not stock:
-                    continue
-                stock["_one_min"] = merged_rows
-                stock["_builder"] = builder
-                stock["candle_source"] = HISTORICAL_CANDLE_SOURCE
-                stock["completed_candle_count"] = len(merged_rows)
-                stock["last_completed_candle"] = merged_rows[-1]["timestamp"]
-                stock["last_tick"] = last_tick
-                stock["data_source_status"] = "LIVE"
-                stock["timestamp"] = now.isoformat()
-        except Exception as exc:
-            main.log.warning("Candle reconciliation failed for %s: %s", symbol, exc)
+                s=main.state['stocks'][symbol]; s['_one_min']=merged_rows; s['_builder']=builder; s['candle_source']=HISTORICAL_CANDLE_SOURCE; s['completed_candle_count']=len(merged_rows); s['last_completed_candle']=merged_rows[-1]['timestamp']; s['last_tick']=last; s['data_source_status']='LIVE'; s['timestamp']=now.isoformat()
+        except Exception as exc: main.log.warning('Candle reconciliation failed for %s: %s',symbol,exc)
 
-
-def _quote_worker(token: str):
+def candle_worker(token):
     while main.in_session(main.now_ist()):
-        try:
-            _refresh_quotes_once(token)
-        except Exception as exc:
-            main.log.warning("Live quote refresh failed: %s", exc)
-        time.sleep(QUOTE_REFRESH_SECONDS)
-
-
-def _candle_worker(token: str):
-    while main.in_session(main.now_ist()):
-        try:
-            _finalize_closed_builders()
-            _reconcile_candles_once(token)
-        except Exception as exc:
-            main.log.warning("Candle reconciliation worker failed: %s", exc)
+        try: finalize(); reconcile(token)
+        except Exception as exc: main.log.warning('Candle reconciliation worker failed: %s',exc)
         time.sleep(CANDLE_RECONCILE_SECONDS)
 
+def quote_worker(token):
+    while main.in_session(main.now_ist()):
+        try:
+            with main.lock: sm=dict(main.state.get('security_map') or {})
+            if len(sm)==len(main.STOCKS):
+                q=main.fetch_market_quote(token,os.environ['DHAN_CLIENT_ID'],sm); now=main.now_ist()
+                with main.lock:
+                    for symbol,x in q.items():
+                        s=main.state['stocks'].get(symbol)
+                        if s and x.get('current') is not None:s['current_price']=x['current']; s['ohlc']['close']=x['current']; s['timestamp']=now.isoformat(); s['data_source_status']='LIVE'
+                    main.state['last_update']=now.isoformat()
+        except Exception as exc: main.log.warning('Optional quote snapshot unavailable: %s',exc)
+        time.sleep(QUOTE_REFRESH_SECONDS)
 
-def _websocket_loop(token: str):
-    client_id = os.environ["DHAN_CLIENT_ID"]
-    reverse = {int(v): k for k, v in main.state["security_map"].items()}
-    url = f"{main.WS_URL}?version=2&token={token}&clientId={client_id}&authType=2"
-    delay = 3.0
-
+def websocket_loop(token):
+    reverse={int(v):k for k,v in main.state['security_map'].items()}; url=f'{main.WS_URL}?version=2&token={token}&clientId={os.environ["DHAN_CLIENT_ID"]}&authType=2'; delay=3
     while main.in_session(main.now_ist()):
         try:
             async def session():
-                nonlocal delay
-                async with main.websockets.connect(url, ping_interval=20, ping_timeout=20, close_timeout=5, max_size=None) as ws:
-                    instruments = [{"ExchangeSegment": "NSE_EQ", "SecurityId": sid} for sid in main.state["security_map"].values()]
-                    for start in range(0, len(instruments), 100):
-                        batch = instruments[start:start + 100]
-                        await ws.send(json.dumps({
-                            "RequestCode": 17,
-                            "InstrumentCount": len(batch),
-                            "InstrumentList": batch,
-                        }))
-                    with main.lock:
-                        main.state["source_status"] = "LIVE"
-                    main.log.info("Dhan real-time websocket connected: %d instruments", len(instruments))
-                    delay = 3.0
+                async with main.websockets.connect(url,ping_interval=20,ping_timeout=20,close_timeout=5,max_size=None) as ws:
+                    instruments=[{'ExchangeSegment':'NSE_EQ','SecurityId':sid} for sid in main.state['security_map'].values()]
+                    for start in range(0,len(instruments),100):
+                        batch=instruments[start:start+100]; await ws.send(json.dumps({'RequestCode':17,'InstrumentCount':len(batch),'InstrumentList':batch}))
+                    with main.lock: main.state['source_status']='LIVE'
+                    main.log.info('Dhan real-time websocket connected: %d instruments',len(instruments))
                     while main.in_session(main.now_ist()):
-                        message = await asyncio.wait_for(ws.recv(), timeout=35)
-                        parsed_any = False
-                        for tick in _parse_quote_packets(message):
-                            parsed_any = True
-                            symbol = reverse.get(int(tick["security_id"]))
+                        message=await asyncio.wait_for(ws.recv(),timeout=35)
+                        if isinstance(message,str):continue
+                        for tick in parse_packets(message):
+                            symbol=reverse.get(int(tick['security_id']))
                             if symbol:
-                                try:
-                                    _ingest_tick(symbol, tick)
-                                except DataIntegrityError as exc:
-                                    main.log.warning("Rejected live tick for %s: %s", symbol, exc)
-                        _finalize_closed_builders()
-                        if not parsed_any and isinstance(message, (bytes, bytearray)) and message and message[0] == 50:
-                            main.log.warning("Dhan websocket sent feed-disconnect packet")
-            asyncio.run(session())
+                                try:ingest(symbol,tick)
+                                except DataIntegrityError as exc:main.log.warning('Rejected live tick for %s: %s',symbol,exc)
+                        finalize()
+            asyncio.run(session()); delay=3
         except Exception as exc:
-            with main.lock:
-                main.state["source_status"] = "RECONNECTING"
-            if not main.in_session(main.now_ist()):
-                break
-            main.log.warning("Dhan websocket disconnected: %s; retry in %.1fs", exc, delay)
-            time.sleep(delay)
-            delay = min(30.0, delay * 2.0)
+            with main.lock:main.state['source_status']='RECONNECTING'
+            if not main.in_session(main.now_ist()):break
+            main.log.warning('Dhan websocket disconnected: %s; retry in %.1fs',exc,delay); time.sleep(delay); delay=min(30,delay*2)
 
-
-def _checkpoint_worker():
+def checkpoint():
     while True:
         try:
             if main.in_session(main.now_ist()):
-                with main.lock:
-                    date_value = main.state.get("trading_date")
-                    stocks = {k: main.clean_stock(v) for k, v in main.state.get("stocks", {}).items()}
-                if date_value and stocks:
-                    try:
-                        store.save_market(date_value, stocks)
-                    except Exception as exc:
-                        main.log.warning("Intraday checkpoint failed: %s", exc)
+                with main.lock:date=main.state.get('trading_date'); stocks={k:main.clean_stock(v) for k,v in main.state.get('stocks',{}).items()}
+                if date and stocks:
+                    try:store.save_market(date,stocks)
+                    except Exception as exc:main.log.warning('Intraday checkpoint failed: %s',exc)
                 time.sleep(CHECKPOINT_SECONDS)
-            else:
-                time.sleep(10)
-        except Exception as exc:
-            main.log.warning("Checkpoint worker error: %s", exc)
-            time.sleep(CHECKPOINT_SECONDS)
+            else:time.sleep(10)
+        except Exception as exc:main.log.warning('Checkpoint worker error: %s',exc); time.sleep(CHECKPOINT_SECONDS)
 
-
-def _supervisor():
-    main.log.info("PSY29 live supervisor started")
+def supervisor():
+    main.log.info('PSY29 live supervisor started')
     while True:
+        now=main.now_ist()
+        with main.lock:
+            reset_for_trading_date(main.state,now.date()); main.state['market_session_status']=main.session_status(now)
+            if not main.in_session(now):main.state['source_status']='WAITING_FOR_SESSION'; main.state['stocks']={}
+            ready=main.state.get('source_status') in {'CONNECTING','LIVE','RECONNECTING'} and len(main.state.get('stocks',{}))==len(main.STOCKS)
+        if not main.in_session(now):time.sleep(2);continue
+        if ready:time.sleep(1);continue
+        with main.lock:main.state['source_status']='CONNECTING'
         try:
-            now = main.now_ist()
-            with main.lock:
-                reset_for_trading_date(main.state, now.date())
-                main.state["market_session_status"] = main.session_status(now)
-                if not main.in_session(now):
-                    main.state["source_status"] = "WAITING_FOR_SESSION"
-                    main.state["stocks"] = {}
-            if not main.in_session(now):
-                time.sleep(2)
-                continue
+            main.log.info('Opening live Dhan session for %s',now.date().isoformat()); token,expiry=main.generate_access_token(); sm=main.load_security_map()
+            with main.lock:main.state['access_token_expiry']=expiry
+            seed(token,sm)
+            threading.Thread(target=candle_worker,args=(token,),daemon=True,name='psy29-candle-reconcile').start()
+            threading.Thread(target=quote_worker,args=(token,),daemon=True,name='psy29-quote-refresh').start()
+            websocket_loop(token)
+        except Exception as exc: main.log.exception('Live collector failure: %s',exc); time.sleep(5)
 
-            with main.lock:
-                ready = main.state.get("source_status") in {"CONNECTING", "LIVE", "RECONNECTING"} and len(main.state.get("stocks", {})) == len(main.STOCKS)
-            if ready:
-                time.sleep(1)
-                continue
-
-            with main.lock:
-                main.state["source_status"] = "CONNECTING"
-            try:
-                main.log.info("Opening live Dhan session for %s", now.date().isoformat())
-                token, expiry = main.generate_access_token()
-                security_map = main.load_security_map()
-                with main.lock:
-                    main.state["access_token_expiry"] = expiry
-                _seed_state(token, security_map)
-                threading.Thread(target=_quote_worker, args=(token,), daemon=True, name="psy29-quote-refresh").start()
-                threading.Thread(target=_candle_worker, args=(token,), daemon=True, name="psy29-candle-reconcile").start()
-                _websocket_loop(token)
-            except Exception as exc:
-                if "Token can be generated once every 2 minutes" in str(exc):
-                    with main.lock:
-                        main.state["source_status"] = "AUTH_COOLDOWN"
-                    time.sleep(AUTH_COOLDOWN_SECONDS)
-                else:
-                    main.log.exception("Live collector failure: %s", exc)
-                    with main.lock:
-                        main.state["source_status"] = "ERROR"
-                    time.sleep(5)
-        except Exception as exc:
-            main.log.exception("Supervisor failure: %s", exc)
-            with main.lock:
-                main.state["source_status"] = "ERROR"
-            time.sleep(5)
-
-
-def _machine_payload():
-    now = main.now_ist()
+def payload():
+    now=main.now_ist()
     with main.lock:
-        reset_for_trading_date(main.state, now.date())
-        in_session = main.in_session(now)
-        source = main.state.get("source_status") or "WAITING_FOR_SESSION"
-        if not in_session:
-            source = "WAITING_FOR_SESSION" if (now.hour, now.minute) < main.MARKET_OPEN else "POST_CLOSE"
-        stocks = {k: main.clean_stock(v) for k, v in main.state.get("stocks", {}).items()}
-        raw = {
-            "service": "PSY29 Live Data",
-            "timestamp": now.isoformat(),
-            "trading_date": now.date().isoformat(),
-            "market_session_status": main.session_status(now),
-            "data_source_status": source,
-            "stocks_expected": len(main.STOCKS),
-            "stocks": stocks,
-            "candle_policy": {
-                "source": CANDLE_SOURCE,
-                "fallback_source": HISTORICAL_CANDLE_SOURCE,
-                "first_completed_minute": "09:16",
-                "regular_session": "09:15-15:15 IST",
-                "synthetic_candles": False,
-                "rule": "Only completed bars from Dhan websocket ticks or Dhan intraday candles are published; no bar is fabricated from server time.",
-            },
-        }
-
-    if not in_session:
-        raw["diagnostic"] = {"status": "OK", "error_code": None, "error_message": None, "stage": "SESSION", "affected_stocks": [], "recovery_action": "WAIT_FOR_SESSION" if raw["market_session_status"] == "PRE_OPEN" else None, "data_safe": True}
-    else:
-        missing = [s for s in main.STOCKS if s not in stocks or stocks[s].get("current_price") is None]
-        no_candles = [s for s in main.STOCKS if s in stocks and stocks[s].get("completed_candle_count", 0) == 0]
-        if missing:
-            raw["diagnostic"] = {"status": "RECOVERING", "error_code": "LIVE_STOCKS_PENDING", "error_message": "Waiting for live Dhan feed state for: " + ",".join(missing), "stage": "FEED", "affected_stocks": missing, "recovery_action": "AUTOMATIC_RECONNECT_AND_QUOTE_REFRESH", "data_safe": False}
-        elif source in {"LIVE", "RECONNECTING"}:
-            raw["diagnostic"] = {"status": "OK" if not no_candles else "RECOVERING", "error_code": None if not no_candles else "CANDLE_RECONCILIATION_IN_PROGRESS", "error_message": None if not no_candles else "Waiting for completed Dhan 1-minute candles.", "stage": "WEBSOCKET", "affected_stocks": no_candles, "recovery_action": "AUTOMATIC_CANDLE_RECONCILIATION" if no_candles else None, "data_safe": True if not no_candles else False, "last_good_tick": raw["timestamp"]}
-        else:
-            raw["diagnostic"] = {"status": "RECOVERING", "error_code": "COLLECTOR_NOT_LIVE", "error_message": f"Live data source status is {source}", "stage": "FEED", "affected_stocks": [], "recovery_action": "AUTOMATIC_RECONNECT", "data_safe": False}
+        reset_for_trading_date(main.state,now.date()); stocks={k:main.clean_stock(v) for k,v in main.state.get('stocks',{}).items()}; source=main.state.get('source_status') or 'WAITING_FOR_SESSION'
+    raw={'service':'PSY29 Live Data','timestamp':now.isoformat(),'trading_date':now.date().isoformat(),'market_session_status':main.session_status(now),'data_source_status':source,'stocks_expected':len(main.STOCKS),'stocks':stocks,'candle_policy':{'source':CANDLE_SOURCE,'fallback_source':HISTORICAL_CANDLE_SOURCE,'first_completed_minute':'09:16','regular_session':'09:15-15:15 IST','synthetic_candles':False,'rule':'Only completed bars from Dhan websocket ticks or Dhan intraday candles are published; no bar is fabricated from server time.'}}
+    missing=[s for s in main.STOCKS if s not in stocks or stocks[s].get('current_price') is None]; no=[s for s in main.STOCKS if s in stocks and stocks[s].get('completed_candle_count',0)==0]
+    raw['diagnostic']={'status':'OK' if not missing and not no else 'RECOVERING','error_code':None if not missing and not no else 'LIVE_DATA_PENDING','error_message':None if not missing and not no else 'Waiting for automatic Dhan live state/candle reconciliation.','stage':'FEED','affected_stocks':missing or no,'recovery_action':None if not missing and not no else 'AUTOMATIC_RECONNECT_AND_RECONCILIATION','data_safe':not missing and not no}
     return main.normalize_market(raw)
 
-
-def _json_response():
-    return JSONResponse(content=_machine_payload(), headers=_headers(str(time.time_ns())))
-
-
-@main.app.get("/api/v1/live.json")
-def live_json():
-    return _json_response()
-
-
-@main.app.get("/api/v1/market.json")
-def market_json():
-    return _json_response()
-
-
-@main.app.get("/data.json")
-def data_json():
-    return _json_response()
-
-
-@main.app.get("/data.txt")
-def data_txt():
-    return Response(content=json.dumps(_machine_payload(), separators=(",", ":"), ensure_ascii=False), media_type="text/plain", headers=_headers(str(time.time_ns())))
-
-
-@main.app.get("/live.txt")
-def live_txt():
-    return data_txt()
-
-
-def _safe_root():
-    now = main.now_ist()
-    with main.lock:
-        stocks_loaded = len(main.state.get("stocks", {}))
-        source = main.state.get("source_status") or "WAITING_FOR_SESSION"
-        last_update = main.state.get("last_update")
-    if (now.hour, now.minute) < main.MARKET_OPEN:
-        source = "WAITING_FOR_SESSION"
-    return {"service": "PSY29 Live Data", "status": source, "trading_date": now.date().isoformat(), "market_session_status": main.session_status(now), "stocks_expected": len(main.STOCKS), "stocks_loaded": stocks_loaded, "last_update": last_update, "postgres": False, "storage_mode": "in-memory intraday session only"}
-
-
-main.app.add_api_route("/", _safe_root, methods=["GET"], include_in_schema=False)
-main.app.router.routes.insert(0, main.app.router.routes.pop())
-
-
-@main.app.get("/health")
-def health():
-    now = main.now_ist()
-    with main.lock:
-        source = main.state.get("source_status") or "WAITING_FOR_SESSION"
-    if (now.hour, now.minute) < main.MARKET_OPEN:
-        source = "WAITING_FOR_SESSION"
-    return {"ok": True, "status": source, "timestamp": now.isoformat(), "candle_source": CANDLE_SOURCE, "fallback_candle_source": HISTORICAL_CANDLE_SOURCE, "synthetic_candles": False, "market_close": "15:15"}
-
-
-main.app.router.routes.insert(0, main.app.router.routes.pop())
-
+def response():return JSONResponse(content=payload(),headers=headers(str(time.time_ns())))
+for route in ['/api/v1/live.json','/api/v1/market.json','/data.json']:main.app.add_api_route(route,response,methods=['GET'])
+@main.app.get('/data.txt')
+def data_txt():return Response(content=json.dumps(payload(),separators=(',',':'),ensure_ascii=False),media_type='text/plain',headers=headers(str(time.time_ns())))
+@main.app.get('/live.txt')
+def live_txt():return data_txt()
+@main.app.get('/')
+def root():
+    with main.lock:return {'service':'PSY29 Live Data','status':main.state.get('source_status'),'trading_date':main.state.get('trading_date'),'market_session_status':main.state.get('market_session_status'),'stocks_expected':len(main.STOCKS),'stocks_loaded':len(main.state.get('stocks',{})),'last_update':main.state.get('last_update'),'postgres':False,'storage_mode':'in-memory intraday session only'}
+@main.app.get('/health')
+def health():return {'ok':True,'status':main.state.get('source_status'),'timestamp':main.now_ist().isoformat(),'candle_source':CANDLE_SOURCE,'fallback_candle_source':HISTORICAL_CANDLE_SOURCE,'synthetic_candles':False,'market_close':'15:15'}
 
 def startup():
-    if getattr(main, "_psy29_runtime_started", False):
-        return
-    main._psy29_runtime_started = True
-    with main.lock:
-        main.state["collector_started"] = True
-        main.state["source_status"] = "WAITING_FOR_SESSION"
-        main.state["market_session_status"] = main.session_status(main.now_ist())
-    threading.Thread(target=_checkpoint_worker, daemon=True, name="psy29-checkpoint").start()
-    threading.Thread(target=_supervisor, daemon=True, name="psy29-supervisor").start()
-
-
-main.app.add_event_handler("startup", startup)
-startup()
-app = main.app
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(main.os.getenv("PORT", "10000")))
+    if getattr(main,'_psy29_runtime_started',False):return
+    main._psy29_runtime_started=True
+    with main.lock:main.state['collector_started']=True; main.state['source_status']='WAITING_FOR_SESSION'; main.state['market_session_status']=main.session_status(main.now_ist())
+    threading.Thread(target=checkpoint,daemon=True,name='psy29-checkpoint').start(); threading.Thread(target=supervisor,daemon=True,name='psy29-supervisor').start()
+main.app.router.on_startup.clear(); main.app.add_event_handler('startup',startup); startup(); app=main.app
+if __name__=='__main__':
+ import uvicorn; uvicorn.run(app,host='0.0.0.0',port=int(os.getenv('PORT','10000')))
